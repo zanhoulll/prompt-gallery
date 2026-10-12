@@ -1,0 +1,22 @@
+# 构建产物
+/target
+
+# 仅当用 PROMPT_GALLERY_DATA_DIR 把数据目录指向项目内时才出现
+# （默认数据目录是 %APPDATA%\PromptGallery\，不在仓库内）
+/data
+
+# 导出包
+*.zip
+
+# 编写输入与文档：不随 Rust 工程入库
+/AGENTS.md
+/CONTEXT.md
+/docs/
+/directory-tree.md
+
+# 编辑器 / 系统杂物
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
