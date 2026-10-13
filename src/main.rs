@@ -619,15 +619,19 @@ impl GalleryView {
                 let mut clicked: Option<Option<i64>> = None;
                 let mut insert_at: Option<(i64, usize)> = None;
                 let mut drag_stopped = false;
+                // 收集每一行的矩形：落点要相对**所有行**判断，而 `dragged()` 只在被拖那一行为真，
+                // 所以不能像以前那样只看被拖行自己的 `rect` / `index`。
+                let mut row_rects: Vec<Rect> = Vec::with_capacity(row_count);
 
-                ScrollArea::vertical()
+                let scroll = ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (index, (id, title, image_file)) in rows.iter().enumerate() {
+                        for (id, title, image_file) in rows.iter() {
                             let selected = Some(*id) == current_id;
                             let width = (ui.available_width() - 8.0).max(60.0);
                             let (rect, response) = ui
                                 .allocate_exact_size(Vec2::new(width, 52.0), Sense::click_and_drag());
+                            row_rects.push(rect);
 
                             // 长按判定：按住超过 REORDER_HOLD 且产生位移，才进入重排。
                             if response.drag_started() {
@@ -636,47 +640,14 @@ impl GalleryView {
                                 self.drag_moved = false;
                                 self.drag_target = None;
                             }
-                            if response.dragged() {
-                                if response.drag_delta().length() > REORDER_SLOP {
-                                    self.drag_moved = true;
-                                }
-                                let held = Instant::now().duration_since(self.drag_started);
-                                if held >= REORDER_HOLD && self.drag_moved {
-                                    let before = ui
-                                        .ctx()
-                                        .pointer_hover_pos()
-                                        .map(|pos| {
-                                            if pos.y >= rect.center().y {
-                                                index + 1
-                                            } else {
-                                                index
-                                            }
-                                        })
-                                        .unwrap_or(index);
-                                    self.drag_target = Some(before.min(row_count));
-                                }
+                            if response.dragged() && response.drag_delta().length() > REORDER_SLOP {
+                                self.drag_moved = true;
                             }
                             if response.drag_stopped() {
                                 drag_stopped = true;
                             }
                             if response.clicked() && !self.drag_moved {
                                 clicked = Some(Some(*id));
-                            }
-
-                            // 长按拖拽时画一条插入位置指示线。
-                            if self.drag_row_id == Some(*id) && self.drag_moved {
-                                if let Some(insert) = self.drag_target {
-                                    let y = if insert > index {
-                                        rect.bottom() + 1.0
-                                    } else {
-                                        rect.top() - 1.0
-                                    };
-                                    ui.painter().hline(
-                                        rect.x_range(),
-                                        y,
-                                        Stroke::new(2.0, Color32::from_rgb(120, 170, 255)),
-                                    );
-                                }
                             }
 
                             paint_sidebar_row(
@@ -693,12 +664,31 @@ impl GalleryView {
                         ui.add_space(4.0);
                     });
 
-                // 指针落到列表下方 => 插到末尾。
+                // 落点：按键针 y 与所有行的中心线求插入下标（指针上方有几行）。
                 if self.drag_row_id.is_some() && self.drag_moved {
-                    if let Some(pos) = ui.ctx().pointer_hover_pos() {
-                        let bottom = ui.min_rect().bottom();
-                        if pos.y > bottom {
-                            self.drag_target = Some(row_count);
+                    let held = Instant::now().duration_since(self.drag_started);
+                    if held >= REORDER_HOLD {
+                        if let Some(pos) = ui.ctx().pointer_hover_pos() {
+                            let row_centers: Vec<f32> =
+                                row_rects.iter().map(|rect| rect.center().y).collect();
+                            self.drag_target =
+                                Some(drag_insertion_index(pos.y, ui.min_rect().bottom(), &row_centers));
+                        }
+                    }
+
+                    // 长按拖拽时画一条插入位置指示线：画在真实落点的行边界上，
+                    // 而不是被拖行自己的边缘，所以目标离被拖行很远时也看得见。
+                    if let Some(insert) = self.drag_target {
+                        let x_range = row_rects
+                            .first()
+                            .map(|rect| rect.x_range())
+                            .unwrap_or_else(|| ui.min_rect().x_range());
+                        if let Some(y) = insertion_line_y(insert, &row_rects) {
+                            ui.painter_at(scroll.inner_rect).hline(
+                                x_range,
+                                y,
+                                Stroke::new(2.0, Color32::from_rgb(120, 170, 255)),
+                            );
                         }
                     }
                 }
@@ -730,13 +720,9 @@ impl GalleryView {
         let Some(source) = order.iter().position(|id| *id == from) else {
             return;
         };
-        let mut destination = insert.min(order.len());
-        if destination > source {
-            destination -= 1;
-        }
-        if destination == source {
+        let Some(destination) = reorder_destination(source, insert, order.len()) else {
             return;
-        }
+        };
         let moved = order.remove(source);
         order.insert(destination, moved);
         if let Err(err) = self.store.reorder(&order) {
@@ -1259,6 +1245,61 @@ fn paint_sidebar_row(
     );
 }
 
+// ---------------------------------------------------------------- 重排落点
+
+/// 依据指针 y 与各行中心线求出**插入下标**：语义是「指针上方（中心线以上）的行数」，
+/// 取值恒在 `0..=row_centers.len()` 内。
+///
+/// 与中心线齐平时算作「在其上方」，与旧单行判定的 `pos.y >= rect.center().y` 保持一致；
+/// 于是被拖行自身占据的区间自然成为空操作区间（插到自己前面或后面都不改变顺序）。
+fn insertion_index(pointer_y: f32, row_centers: &[f32]) -> usize {
+    row_centers
+        .iter()
+        .filter(|center| pointer_y >= **center)
+        .count()
+}
+
+/// 拖拽落点：按键针 y 与所有行的中心线求插入下标。
+///
+/// `list_bottom_y` 是列表区域的底边；指针落到它下方即视为「插到末尾」——保留原有语义，
+/// 也是「一次把行拖到列表最后」最省事的手势。
+fn drag_insertion_index(pointer_y: f32, list_bottom_y: f32, row_centers: &[f32]) -> usize {
+    if pointer_y > list_bottom_y {
+        row_centers.len()
+    } else {
+        insertion_index(pointer_y, row_centers)
+    }
+}
+
+/// 把插入下标换算成「移除源元素后」应插入的下标；返回 `None` 表示原地松手、顺序不变。
+///
+/// `insert` 是 [`insertion_index`] 的结果（`0..=len`）：先按原数组夹取到 `len`，
+/// 若落在源元素之后则减一（原数组里插在其后 == 移除后插在其所在位），最后与源下标比较。
+fn reorder_destination(source: usize, insert: usize, len: usize) -> Option<usize> {
+    let destination = insert.min(len);
+    let destination = if destination > source {
+        destination - 1
+    } else {
+        destination
+    };
+    (destination != source).then_some(destination)
+}
+
+/// 插入指示线应画的 y 坐标：落在插入处的两行边界上；首行之上 / 末行之下各留 1pt，
+/// 让线不至于完全压住行边框。列表为空时没有可画的位置。
+fn insertion_line_y(insert: usize, row_rects: &[Rect]) -> Option<f32> {
+    let first = row_rects.first()?;
+    let last = row_rects.last()?;
+    Some(if insert == 0 {
+        first.top() - 1.0
+    } else if insert >= row_rects.len() {
+        last.bottom() + 1.0
+    } else {
+        // 相邻两行之间（行距可能大于 0），取缝隙中线。
+        (row_rects[insert - 1].bottom() + row_rects[insert].top()) / 2.0
+    })
+}
+
 // ---------------------------------------------------------------- 字体与图标
 
 /// 挂上 Windows 自带的 CJK 字体，保证中文界面不出现豆腐块。
@@ -1345,5 +1386,153 @@ fn open_in_explorer(path: &Path) {
     #[cfg(not(target_os = "windows"))]
     {
         let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
+// ---------------------------------------------------------------- 单元测试
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 四行列表的行中心线：52pt 行高 + egui 默认行距 3pt。
+    fn centers4() -> Vec<f32> {
+        vec![30.0, 85.0, 140.0, 195.0]
+    }
+
+    /// 按 `move_row` 的同一套算术模拟一次「拖拽松手」后的顺序：
+    /// `insert` 为落点下标（指针上方有几行）。
+    fn drag_release(ids: &[&str], source: usize, insert: usize) -> Vec<String> {
+        let mut order: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        if let Some(destination) = reorder_destination(source, insert, order.len()) {
+            let moved = order.remove(source);
+            order.insert(destination, moved);
+        }
+        order
+    }
+
+    #[test]
+    fn insertion_index_counts_rows_above_pointer() {
+        let centers = centers4();
+        assert_eq!(insertion_index(0.0, &centers), 0); // 首行中心之上
+        assert_eq!(insertion_index(29.9, &centers), 0);
+        assert_eq!(insertion_index(30.0, &centers), 1); // 与首行中心齐平：算在其上方
+        assert_eq!(insertion_index(57.0, &centers), 1); // 第 1、2 行之间
+        assert_eq!(insertion_index(112.0, &centers), 2); // 第 2、3 行之间
+        assert_eq!(insertion_index(167.5, &centers), 3); // 第 3、4 行之间
+        assert_eq!(insertion_index(195.0, &centers), 4); // 与末行中心齐平
+        assert_eq!(insertion_index(1000.0, &centers), 4); // 末行中心之下 => 末尾
+        assert_eq!(insertion_index(0.0, &[]), 0); // 空列表
+    }
+
+    #[test]
+    fn insertion_index_never_exceeds_row_count() {
+        let centers = centers4();
+        for y in [-500.0, 0.0, 30.0, 500.0, 10_000.0] {
+            assert!(insertion_index(y, &centers) <= centers.len());
+        }
+    }
+
+    #[test]
+    fn drag_insertion_index_keeps_below_list_means_end() {
+        let centers = centers4();
+        let list_bottom = 240.0; // 列表底边（末行 bottom 217 之下）
+        assert_eq!(drag_insertion_index(100.0, list_bottom, &centers), 2);
+        assert_eq!(drag_insertion_index(230.0, list_bottom, &centers), 4);
+        assert_eq!(drag_insertion_index(240.0, list_bottom, &centers), 4); // 正好在底边：不算「下方」
+        assert_eq!(drag_insertion_index(241.0, list_bottom, &centers), 4); // 落到列表下方 => 末尾
+        assert_eq!(drag_insertion_index(9999.0, list_bottom, &centers), 4);
+        assert_eq!(drag_insertion_index(50.0, list_bottom, &[]), 0); // 空列表
+        assert_eq!(drag_insertion_index(9999.0, list_bottom, &[]), 0);
+    }
+
+    #[test]
+    fn insertion_line_sits_on_real_gap() {
+        let rows: Vec<Rect> = (0..4)
+            .map(|index| {
+                let top = index as f32 * 55.0;
+                Rect::from_min_size(egui::pos2(0.0, top), Vec2::new(200.0, 52.0))
+            })
+            .collect();
+        // 首行之上 / 末行之下（含 insert == row_count）：各留 1pt。
+        // 末行 top = 3 * 55 = 165、bottom = 217，故末尾线在 218。
+        assert_eq!(insertion_line_y(0, &rows), Some(-1.0));
+        assert_eq!(insertion_line_y(4, &rows), Some(218.0));
+        assert_eq!(insertion_line_y(99, &rows), Some(218.0)); // 越界也夹到末尾
+        // 中间落在两行缝隙的中线上，而不是被拖行自己的边缘。
+        assert_eq!(insertion_line_y(1, &rows), Some((52.0 + 55.0) / 2.0));
+        assert_eq!(insertion_line_y(2, &rows), Some((107.0 + 110.0) / 2.0));
+        assert_eq!(insertion_line_y(3, &rows), Some((162.0 + 165.0) / 2.0));
+        // 空列表没有可画的位置。
+        assert_eq!(insertion_line_y(0, &[]), None);
+    }
+
+    /// 验收里点名的五条边界：第一行拖到最后、最后一行拖到最前、向下移一位、
+    /// 向上移一位、原地松手。
+    #[test]
+    fn drag_edges_reorder_as_expected() {
+        let ids = ["A", "B", "C", "D"];
+
+        // 第一行拖到最后（指针落到列表下方 => insert = row_count = 4）。
+        assert_eq!(drag_release(&ids, 0, 4), ["B", "C", "D", "A"]);
+        // 最后一行拖到最前（指针在首行中心之上 => insert = 0）。
+        assert_eq!(drag_release(&ids, 3, 0), ["D", "A", "B", "C"]);
+        // 向下移一位：A 落到 B、C 之间 => insert = 2。
+        assert_eq!(drag_release(&ids, 0, 2), ["B", "A", "C", "D"]);
+        // 向上移一位：C 落到 A、B 之间 => insert = 1。
+        assert_eq!(drag_release(&ids, 2, 1), ["A", "C", "B", "D"]);
+        // 原地松手：插到自己前面/后面都不改变顺序。
+        for source in 0..ids.len() {
+            assert_eq!(drag_release(&ids, source, source), ids.map(str::to_string));
+            assert_eq!(
+                drag_release(&ids, source, source + 1),
+                ids.map(str::to_string)
+            );
+        }
+    }
+
+    /// 把「指针位置」和「落点下标」串起来，验证被拖行自身区间是空操作区间。
+    #[test]
+    fn pointer_within_dragged_row_is_noop() {
+        let ids = ["A", "B", "C", "D"];
+        let centers = centers4();
+
+        // 指针停在被拖行自己的中心附近：插到自己前面或后面 => 空操作。
+        assert_eq!(
+            drag_release(&ids, 1, insertion_index(centers[1], &centers)),
+            ids.map(str::to_string)
+        );
+        assert_eq!(
+            drag_release(&ids, 1, insertion_index(centers[1] + 20.0, &centers)),
+            ids.map(str::to_string)
+        );
+
+        // 拖到末行中心之下：B 落到末尾。
+        assert_eq!(
+            drag_release(&ids, 1, insertion_index(1000.0, &centers)),
+            ["A", "C", "D", "B"]
+        );
+        // 拖到首行中心之上：D 落到最前。
+        assert_eq!(
+            drag_release(&ids, 3, insertion_index(0.0, &centers)),
+            ["D", "A", "B", "C"]
+        );
+        // 已经在第一个，再往上拖仍是空操作。
+        assert_eq!(
+            drag_release(&ids, 0, insertion_index(0.0, &centers)),
+            ids.map(str::to_string)
+        );
+    }
+
+    /// `insert` 越界（例如指针落到列表下方给的是 `row_count`）必须被夹住，不能 panic。
+    #[test]
+    fn reorder_destination_clamps_out_of_range_insert() {
+        assert_eq!(reorder_destination(0, 4, 4), Some(3));
+        assert_eq!(reorder_destination(0, 999, 4), Some(3));
+        assert_eq!(reorder_destination(0, 0, 4), None);
+        assert_eq!(reorder_destination(0, 1, 4), None);
+        assert_eq!(reorder_destination(3, 0, 4), Some(0));
+        assert_eq!(reorder_destination(3, 3, 4), None);
+        assert_eq!(reorder_destination(3, 4, 4), None);
     }
 }
