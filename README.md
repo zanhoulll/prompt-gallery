@@ -5,42 +5,47 @@ _把「一张图片 + 五段正向提示词」存成一条记录，随时一键�
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-3c873a?style=flat-square)](https://www.microsoft.com/windows)
 [![Rust](https://img.shields.io/badge/Rust-%3E%3D1.82-000000?style=flat-square&logo=rust)](https://rustup.rs/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
-[![Binary size](https://img.shields.io/badge/binary-13.9%20MB-555?style=flat-square)](#从源码构建)
 
-[功能](#功能) • [快速开始](#快速开始) • [使用](#使用) • [数据位置与备份](#数据位置与备份) • [开发](#开发) • [疑难排查](#疑难排查)
+[功能](#功能) • [快速开始](#快速开始) • [使用](#使用) • [数据位置与备份](#数据位置与备份) • [开发](#开发) • [疑难排查](#疑难排查) • [更新日志](CHANGELOG.md)
 
 一个用 Rust + egui 写的 Windows 桌面工具。出图时反复使用的提示词通常散落在聊天记录、记事本和图片文件夹里；Prompt Gallery 把「一张参考图 + 对应的正向提示词」固定成一条**示例**，提示词按固定的五个**分区**组织，点一次即可复制成可直接粘贴进 ComfyUI 的一整段正文。
 
-窗口标题与显示名称为 **Prompt Gallery**，目标是低资源占用（常驻内存约 30–50 MB）。
+窗口标题与显示名称为 **Prompt Gallery**（当前版本 v0.1.1），目标是低资源占用（常驻内存约 30–50 MB）。
 
 ## 功能
 
-- 🖼️ **图片是记录的一部分** — 点「选择图片…」或把图片拖进窗口即可入库；文件按内容的 blake3 哈希命名，同一张图重复导入不会占第二份空间
+- 🖼️ **图片是记录的一部分** — 点图片框或把图片拖进窗口即可选图；图片在保存时按内容的 blake3 哈希入库，同一张图重复导入不会占第二份空间
 - ✍️ **五分区提示词编辑器** — 同一个滚动容器里无缝拼接的五个文本框，视觉上是一个框；中文输入法、撤销/重做、选区都可用
 - 📋 **一键复制** — 只把五个分区的正文写进剪贴板，分区标题不进正文，粘贴即用
-- 🗂️ **侧边栏列表** — 带缩略图，**长按约 0.2 秒后拖动**可重排顺序；短按仍然是选中，避免误触
+- 🗂️ **侧边栏列表** — 带缩略图，**长按约 0.28 秒后拖动**可重排顺序；短按选中当前示例，短按已选中行的标题即就地改名
 - 💾 **草稿先编辑、后落库** — `+` 新建的示例只是草稿，点「保存」才写库并触发图片复制入库
 - 📦 **整库打包** — 导出 `prompt-gallery-<时间戳>.zip`（JSON 元数据 + 图片文件），换机器导入即可恢复，且不会覆盖已有示例
-- 🪶 **零外部运行时** — 单个 exe，SQLite 以 bundled 方式静态链接，不需要额外驱动
+- 🪶 **单个 exe，不需要额外驱动** — SQLite 以 bundled 方式静态链接；但 exe 动态依赖 VCRUNTIME140.dll，需先安装 [Microsoft Visual C++ 2015–2022 可再发行组件 (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe)
 
 ## 快速开始
 
 ### 前置条件
 
+**运行**
+
 - **Windows 10/11 (x64)**
+- **Microsoft Visual C++ 2015–2022 可再发行组件 (x64)** — 提供 `VCRUNTIME140.dll`；绝大多数机器已随其他软件装好，缺失时到 <https://aka.ms/vs/17/release/vc_redist.x64.exe> 安装
+
+**从源码构建时另需**
+
 - **[Rust 工具链](https://rustup.rs/)** — stable，默认 host 为 `x86_64-pc-windows-msvc`（`rust-version = 1.82`）
 - **MSVC 生成工具** — Visual Studio 2022 生成工具或完整版 VS（提供链接器）
 
 ### 从源码构建
 
 ```powershell
-git clone <repo-url> prompt-gallery
+git clone https://github.com/zanhoulll/prompt-gallery
 cd prompt-gallery
 
 # 开发构建
 cargo run
 
-# 发布构建：target\release\prompt-gallery.exe（约 13.9 MB，自包含）
+# 发布构建：target\release\prompt-gallery.exe
 cargo build --release
 ```
 
@@ -50,7 +55,7 @@ cargo build --release
 
 1. 点侧边栏的 `+` 新建示例 —— 此时它是一条**草稿**，尚未落库。
 2. 填标题、选图片（或把图片拖进窗口）、按分区粘贴提示词。
-3. 点「保存为新示例」—— 草稿落库，图片同时复制进托管目录。
+3. 点「保存」/「保存为新示例」—— 草稿落库到列表顶部，图片此时才按内容哈希复制进托管目录。
 4. 之后随时点「复制提示词」，把正文粘贴进 ComfyUI。
 
 ### 五个分区
@@ -73,8 +78,8 @@ cargo build --release
 | :-- | :-- |
 | `Ctrl+S` | 保存当前示例 |
 | `Ctrl+Shift+S` | 另存为副本（原示例保持不变） |
-| `Ctrl+R` | 重命名 |
-| `Enter`（标题框内） | 保存 |
+| `Ctrl+R` | 内联编辑当前示例的标题（侧边栏） |
+| `Esc`（内联编辑中） | 取消编辑 |
 
 > [!TIP]
 > 复制提示词时**不会**带上分区标题，所以粘贴进 ComfyUI 的就是一段干净的逗号分隔提示词，不需要再手工删行。
@@ -88,7 +93,7 @@ cargo build --release
 | 数据库 | `%APPDATA%\PromptGallery\gallery.sqlite3` |
 | 托管图片 | `%APPDATA%\PromptGallery\images\<哈希>.<扩展名>` |
 
-界面右上角的「打开数据目录」可直接打开该目录。
+底栏的「打开数据目录」可直接打开该目录。
 
 > [!IMPORTANT]
 > 数据库和 `images/` 目录是配套的：手工备份时请把两者一起复制。日常备份建议直接用「导出图库…」，它会打包成一个自包含的 zip。
@@ -119,7 +124,7 @@ cargo run --release
 ## 开发
 
 ```powershell
-cargo test                  # 11 项单元 / 集成测试
+cargo test                  # 25 项单元 / 集成测试
 cargo check --all-targets   # 类型检查
 cargo build --release
 ```
@@ -151,6 +156,10 @@ tests/
 ```
 
 ## 疑难排查
+
+**双击启动报「找不到 VCRUNTIME140.dll」**
+
+exe 动态链接 MSVC 运行库，系统缺少它时无法启动。安装 [Microsoft Visual C++ 2015–2022 可再发行组件 (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe) 后重试；已装却仍报错，通常是只装了 x86 版，需要 x64 版。
 
 **启动后中文显示为方块**
 

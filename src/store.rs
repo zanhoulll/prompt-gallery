@@ -142,30 +142,46 @@ impl Store {
         Ok(example)
     }
 
-    /// 插入新示例（草稿落库），返回新 id。
+    /// 追加新示例到列表末尾，返回新 id。
     ///
+    /// 导入归档与开发用 seed 走这里，保持「追加」语义（§8 有意的不对称）。
     /// 图片必须先由 [`Store::store_image_bytes`] 落盘，这里只记哈希。
     pub fn insert(&mut self, example: &mut Example) -> Result<i64> {
-        self.insert_inner(example, None)
+        self.insert_inner(example, None, false)
     }
 
-    /// 以指定 id 插入（导入归档时沿用原 id）。
+    /// 以指定 id 插入（导入归档时沿用原 id），同样追加到末尾。
     pub fn insert_with_id(&mut self, example: &mut Example, id: i64) -> Result<i64> {
-        self.insert_inner(example, Some(id))
+        self.insert_inner(example, Some(id), false)
     }
 
-    fn insert_inner(&mut self, example: &mut Example, forced_id: Option<i64>) -> Result<i64> {
+    /// 草稿落库：新示例占 position 0，其余示例依次后移（§8「保存后留在顶部」）。
+    pub fn insert_at_top(&mut self, example: &mut Example) -> Result<i64> {
+        self.insert_inner(example, None, true)
+    }
+
+    fn insert_inner(
+        &mut self,
+        example: &mut Example,
+        forced_id: Option<i64>,
+        at_top: bool,
+    ) -> Result<i64> {
         let now = now_unix();
-        if example.position == 0 && self.row_count() > 0 {
+        if !at_top && example.position == 0 && self.row_count() > 0 {
             example.position = self.next_position();
         }
         let sections = example.sections.clone();
         let title = example.title.trim().to_string();
         let image_hash = example.image_hash.clone();
         let image_ext = example.image_ext.clone();
-        let position = example.position;
+        let mut position = example.position;
 
         let tx = self.conn.transaction()?;
+        if at_top {
+            // 现有示例整体后移一位，给草稿腾出 position 0。
+            tx.execute("UPDATE examples SET position = position + 1", [])?;
+            position = 0;
+        }
         let id = match forced_id {
             Some(id) => {
                 tx.execute(
@@ -188,6 +204,7 @@ impl Store {
         tx.commit()?;
 
         example.id = Some(id);
+        example.position = position;
         example.title = title;
         example.created_at = now;
         example.updated_at = now;

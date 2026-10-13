@@ -40,8 +40,8 @@ const HEADER_GRAY: Color32 = Color32::from_gray(150);
 const SEAM_COLOR: Color32 = Color32::from_gray(72);
 /// 图片框背景。
 const IMAGE_BOX_FILL: Color32 = Color32::from_rgb(28, 30, 34);
-/// 「长按拖拽重排」的判定时间：按住这个时长之后才允许重排，短按仍然是「选中」。
-const REORDER_HOLD: Duration = Duration::from_millis(200);
+/// 「长按拖拽重排」的判定时间（§3.2：280ms，比旧值更迟钝，避免误触重排）。
+const REORDER_HOLD: Duration = Duration::from_millis(280);
 /// 拖拽产生位移的阈值，用于区分点击与重排。
 const REORDER_SLOP: f32 = 4.0;
 /// 状态文案自动淡出的秒数。
@@ -112,13 +112,14 @@ struct GalleryView {
     /// 数据库文件所在目录（缓存成 String，便于 UI 显示与导出）。
     data_dir: String,
     cache: ImageCache,
-    /// 草稿选中、尚未落库的图片尺寸提示。
-    pending_image_size: Option<(u32, u32)>,
+    /// 待入库图片（Pending Image）：只记源路径，保存时才按内容哈希写入托管目录（ADR-0004）。
+    pending_image: Option<PendingImage>,
     status: String,
     status_time: f64,
-    /// 重命名弹窗。
-    rename_open: bool,
-    rename_buffer: String,
+    /// 侧边栏标题的内联编辑状态（§2）。
+    editing_title: Option<InlineEdit>,
+    /// 关于弹窗（§5）。
+    about_open: bool,
     /// 删除确认弹窗。
     delete_confirm: bool,
     /// 切换示例前的未保存改动确认；目标 id（`None` 表示新建草稿）。
@@ -142,11 +143,11 @@ impl GalleryView {
             baseline: None,
             data_dir,
             cache: ImageCache::new(),
-            pending_image_size: None,
+            pending_image: None,
             status: String::new(),
             status_time: f64::NEG_INFINITY,
-            rename_open: false,
-            rename_buffer: String::new(),
+            editing_title: None,
+            about_open: false,
             delete_confirm: false,
             pending_select: None,
             export_open: false,
@@ -169,11 +170,19 @@ impl GalleryView {
     }
 
     /// 是否有未保存改动。
+    ///
+    /// 空草稿（标题、分区都为空且没有待入库图片）不算改动，切走时不弹确认框。
+    /// 待入库图片也要算进来：ADR-0004 后选图只记源路径，不写进当前示例。
     fn dirty(&self) -> bool {
-        match (&self.current, &self.baseline) {
-            (Some(current), Some(baseline)) => current.differs_from(baseline),
-            (Some(_), None) => true,
-            (None, _) => false,
+        let Some(current) = self.current.as_ref() else {
+            return false;
+        };
+        if current.is_blank() && self.pending_image.is_none() {
+            return false;
+        }
+        match &self.baseline {
+            Some(baseline) => current.differs_from(baseline) || self.pending_image.is_some(),
+            None => true,
         }
     }
 
@@ -182,7 +191,8 @@ impl GalleryView {
             Ok(Some(example)) => {
                 self.baseline = Some(example.clone());
                 self.current = Some(example);
-                self.pending_image_size = None;
+                self.pending_image = None;
+                self.editing_title = None;
                 self.cache.drop_preview();
                 self.status = String::new();
             }
@@ -197,7 +207,8 @@ impl GalleryView {
     fn create_draft(&mut self) {
         self.baseline = None;
         self.current = Some(Example::draft(self.store.next_position()));
-        self.pending_image_size = None;
+        self.pending_image = None;
+        self.editing_title = None;
         self.cache.drop_preview();
     }
 
@@ -237,21 +248,41 @@ impl GalleryView {
 
     // ------------------------------------------------------------ 底部动作
 
-    /// 保存：草稿走 insert（此时才触发图片复制入库），已有示例走 update。
+    /// 保存：草稿落库到列表顶部；此时才把待入库图片按内容哈希写入 images/（ADR-0004）。
     fn save_current(&mut self) {
+        // 保存时才读源文件并入库；源文件缺失则报错，不静默丢图。
+        let ingested = match self.pending_image.as_ref() {
+            Some(pending) => match ingest_pending_image(&self.store, pending) {
+                Ok(pair) => Some(pair),
+                Err(err) => {
+                    self.set_error(err);
+                    return;
+                }
+            },
+            None => None,
+        };
+        if let Some((hash, ext)) = ingested {
+            if let Some(example) = self.current.as_mut() {
+                example.image_hash = Some(hash);
+                example.image_ext = Some(ext);
+            }
+        }
+
         let store = &mut self.store;
         let mut result: anyhow::Result<()> = Ok(());
         if let Some(example) = self.current.as_mut() {
             example.title = example.title.trim().to_string();
             result = match example.id {
                 Some(_) => store.update(example),
-                None => store.insert(example).map(|_| ()),
+                // 草稿落库到顶部：position 0，其余示例依次后移（§8）。
+                None => store.insert_at_top(example).map(|_| ()),
             };
         }
         match result {
             Ok(()) => {
                 self.baseline = self.current.clone();
-                self.pending_image_size = None;
+                self.pending_image = None;
+                self.editing_title = None;
                 self.status = "已保存".to_string();
                 self.status_time = f64::NAN; // 下一帧用 ctx 时间刷新
             }
@@ -270,6 +301,7 @@ impl GalleryView {
         current.created_at = now_unix();
         current.updated_at = current.created_at;
         self.baseline = None;
+        self.editing_title = None;
         self.status = "已另存为副本，点「保存」写入图库".to_string();
         self.status_time = f64::NAN;
     }
@@ -292,6 +324,8 @@ impl GalleryView {
             Ok(()) => {
                 self.baseline = None;
                 self.current = None;
+                self.pending_image = None;
+                self.editing_title = None;
                 self.cache.drop_preview();
                 match next {
                     Some(next_id) => self.load_example(next_id),
@@ -304,49 +338,47 @@ impl GalleryView {
         }
     }
 
-    /// 把图片字节复制进托管 `images/` 目录，并挂到当前示例上。
+    /// 选图/拖图：只记住源文件路径，不再当场写入托管目录（ADR-0004）。
     ///
-    /// 扩展名按内容嗅探（`ext_for_bytes`）而不是信任文件名，避免把 jpg 存成 .png。
-    fn embed_image_bytes(&mut self, ctx: &egui::Context, bytes: &[u8], label: &str) {
-        let Some(ext) = store::ext_for_bytes(bytes) else {
-            self.set_status(ctx, format!("无法识别的图片格式：{label}"));
-            return;
-        };
-        if bytes.len() as u64 > MAX_IMAGE_BYTES {
-            self.set_status(
-                ctx,
-                format!("图片过大（{} MB），已拒绝载入", bytes.len() / 1024 / 1024),
-            );
-            return;
-        }
-        match self.store.store_image_bytes(bytes, ext) {
-            Ok((hash, ext)) => {
-                let size = image_size_of(bytes);
-                if let Some(example) = self.current.as_mut() {
-                    example.image_hash = Some(hash);
-                    example.image_ext = Some(ext);
+    /// 这里只读一次源文件做格式/大小校验与尺寸提示；真正的入库发生在保存时。
+    fn set_pending_image(&mut self, ctx: &egui::Context, path: &Path) {
+        let size = match std::fs::read(path) {
+            Ok(bytes) => {
+                if store::ext_for_bytes(&bytes).is_none() {
+                    self.set_status(ctx, format!("无法识别的图片格式：{}", path.display()));
+                    return;
                 }
-                self.pending_image_size = size;
-                self.cache.drop_preview();
-                let hint = match size {
-                    Some((w, h)) => format!("已选择图片 {w}×{h}"),
-                    None => "已选择图片".to_string(),
-                };
-                self.set_status(ctx, hint);
+                if bytes.len() as u64 > MAX_IMAGE_BYTES {
+                    self.set_status(
+                        ctx,
+                        format!("图片过大（{} MB），已拒绝载入", bytes.len() / 1024 / 1024),
+                    );
+                    return;
+                }
+                image_size_of(&bytes)
             }
-            Err(err) => self.set_error(err),
-        }
-    }
-
-    fn embed_image_file(&mut self, ctx: &egui::Context, path: &Path) {
-        match std::fs::read(path) {
-            Ok(bytes) => self.embed_image_bytes(ctx, &bytes, &path.display().to_string()),
             Err(err) => {
                 let err = anyhow::Error::new(err)
                     .context(format!("读取图片失败：{}", path.display()));
                 self.set_error(err);
+                return;
             }
-        }
+        };
+        let label = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        let hint = match size {
+            Some((w, h)) => format!("已选择图片 {w}×{h}（保存后入库）"),
+            None => "已选择图片（保存后入库）".to_string(),
+        };
+        self.pending_image = Some(PendingImage {
+            path: path.to_path_buf(),
+            label,
+            key: format!("pending:{}", path.display()),
+        });
+        self.cache.drop_preview();
+        self.set_status(ctx, hint);
     }
 
     fn export_to(&mut self, ctx: &egui::Context) {
@@ -371,13 +403,33 @@ impl GalleryView {
 /// 单张图片的字节上限，防止误拖入超大文件把内存打满。
 const MAX_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// 只读图片头取尺寸；失败返回 `None`（不阻塞保存流程）。
+/// 只读图片头取尺寸；失败返回 None（不阻塞保存流程）。
 fn image_size_of(bytes: &[u8]) -> Option<(u32, u32)> {
     image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?
         .into_dimensions()
         .ok()
+}
+
+/// 待入库图片到托管文件：读取源路径，按内容哈希写入 images/，返回 (hash, ext)。
+///
+/// 边界（ADR-0004）：源文件在保存前被移动/删除则返回错误，让保存失败并提示重新选择，
+/// 而不是静默丢图；内容哈希命名让重复图片复用同一个文件（另存为时不重复写）。
+fn ingest_pending_image(store: &Store, pending: &PendingImage) -> anyhow::Result<(String, String)> {
+    let bytes = std::fs::read(&pending.path).map_err(|err| {
+        anyhow::Error::new(err).context(format!(
+            "读取待入库图片失败，请重新选择：{}",
+            pending.path.display()
+        ))
+    })?;
+    let ext = store::ext_for_bytes(&bytes).ok_or_else(|| {
+        anyhow::anyhow!("无法识别的图片格式，请重新选择：{}", pending.path.display())
+    })?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        anyhow::bail!("图片过大（{} MB），已拒绝载入", bytes.len() / 1024 / 1024);
+    }
+    store.store_image_bytes(&bytes, ext)
 }
 
 // ---------------------------------------------------------------- 界面
@@ -387,19 +439,14 @@ impl eframe::App for GalleryView {
         let ctx = ui.ctx().clone();
 
         // 拖进窗口的图片文件（与侧边栏重排不冲突：那是内部拖拽，这里是外部文件）。
+        // ADR-0004：只记住源路径，保存时才按内容哈希入库。
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if let Some(file) = dropped.into_iter().next() {
-            match file.bytes() {
-                Ok(bytes) => {
-                    let label = file.path().display().to_string();
-                    self.embed_image_bytes(&ctx, &bytes, &label);
-                }
-                Err(err) => self.set_status(&ctx, format!("读取拖入的文件失败：{err}")),
-            }
+            let path = file.path().to_path_buf();
+            self.set_pending_image(&ctx, &path);
         }
 
         self.handle_shortcuts(&ctx);
-        self.top_bar(ui);
         self.sidebar(ui);
         self.bottom_bar(ui);
         self.central(ui);
@@ -407,7 +454,11 @@ impl eframe::App for GalleryView {
         self.tick_status(&ctx);
         self.window_title(&ctx);
 
-        if self.rename_open || self.delete_confirm || self.pending_select.is_some() {
+        if self.editing_title.is_some()
+            || self.delete_confirm
+            || self.pending_select.is_some()
+            || self.about_open
+        {
             ctx.request_repaint();
         }
     }
@@ -449,108 +500,10 @@ impl GalleryView {
             self.save_current();
         }
         if rename {
-            if let Some(example) = &self.current {
-                self.rename_buffer = example.title.clone();
-                self.rename_open = true;
-            }
+            // §2：Ctrl+R 改为当前行的侧边栏内联编辑，不再弹重命名窗。
+            let target = self.current_id();
+            self.begin_inline_edit(target);
         }
-    }
-
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("top_bar").show(ui, |ui| {
-            ui.add_space(6.0);
-            let mut pick_image = false;
-            let mut clear_image = false;
-            let mut open_data_dir = false;
-            let mut import = false;
-            let mut open_export = false;
-
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("标题").color(HEADER_GRAY).size(12.0));
-                if let Some(example) = self.current.as_mut() {
-                    let response = ui.add(
-                        TextEdit::singleline(&mut example.title)
-                            .id(Id::new("title_edit"))
-                            .hint_text("给这条示例起个名字")
-                            .desired_width(240.0),
-                    );
-                    if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        self.save_current();
-                    }
-                } else {
-                    ui.add_enabled(false, TextEdit::singleline(&mut String::new()));
-                }
-
-                let clipboard_text = self
-                    .current
-                    .as_ref()
-                    .map(|example| example.sections.join_for_clipboard())
-                    .unwrap_or_default();
-                let can_copy = !clipboard_text.is_empty();
-                if ui
-                    .add_enabled(can_copy, egui::Button::new("复制提示词"))
-                    .on_hover_text("只复制五个分区的正文，不含分区标题")
-                    .clicked()
-                {
-                    ui.ctx().copy_text(clipboard_text);
-                    self.set_status(ui.ctx(), "正向提示词已复制到剪贴板".to_string());
-                }
-
-                ui.separator();
-                pick_image = ui
-                    .button("选择图片…")
-                    .on_hover_text("图片会复制进图库托管的 images/ 目录；也可以直接把图片拖进窗口")
-                    .clicked();
-                if self
-                    .current
-                    .as_ref()
-                    .map(|example| example.image_hash.is_some())
-                    .unwrap_or(false)
-                {
-                    clear_image = ui
-                        .button("移除图片")
-                        .on_hover_text("只解除引用，托管目录里的图片文件不会被删除")
-                        .clicked();
-                }
-
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    open_data_dir = ui.button("打开数据目录").clicked();
-                    import = ui.button("导入图库…").clicked();
-                    open_export = ui.button("导出图库…").clicked();
-                });
-            });
-            ui.add_space(6.0);
-
-            if pick_image {
-                let path = rfd::FileDialog::new()
-                    .add_filter("图片", &IMAGE_EXTENSIONS)
-                    .pick_file();
-                if let Some(path) = path {
-                    self.embed_image_file(ui.ctx(), &path);
-                }
-            }
-            if clear_image {
-                if let Some(example) = self.current.as_mut() {
-                    example.image_hash = None;
-                    example.image_ext = None;
-                }
-                self.cache.drop_preview();
-                self.set_status(ui.ctx(), "已移除图片引用".to_string());
-            }
-            if open_data_dir {
-                open_in_explorer(Path::new(&self.data_dir));
-            }
-            if import {
-                self.import_dialog(ui.ctx());
-            }
-            if open_export {
-                self.export_path = Path::new(&self.data_dir)
-                    .join(archive::default_file_name(now_unix()))
-                    .to_string_lossy()
-                    .to_string();
-                self.export_open = true;
-            }
-        });
     }
 
     fn import_dialog(&mut self, ctx: &egui::Context) {
@@ -605,49 +558,102 @@ impl GalleryView {
                 ui.separator();
                 ui.add_space(2.0);
 
-                // 快照一次：遍历期间可能触发选中/新建，避免与 `store` 的可变借用冲突。
-                let rows: Vec<(i64, String, Option<String>)> = self
-                    .store
-                    .rows()
-                    .iter()
-                    .map(|row| (row.id, row.display_title().to_string(), row.image_file_name()))
-                    .collect();
+                // 快照一次：遍历期间可能触发选中/新建，避免与 store 的可变借用冲突。
+                // 草稿行固定在列表最上（id 为 None），它不在 store.rows() 里（§8）。
                 let current_id = self.current_id();
                 let images_dir = self.store.images_dir();
-                let row_count = rows.len();
+                let mut rows: Vec<SidebarRow> = Vec::with_capacity(self.store.row_count() + 1);
+                if let Some(example) = self.current.as_ref().filter(|example| example.is_draft()) {
+                    let thumb = match (&self.pending_image, example.image_file_name()) {
+                        (Some(pending), _) => Some(ThumbSource::Pending {
+                            key: pending.key.clone(),
+                            path: pending.path.clone(),
+                        }),
+                        (None, Some(file_name)) => Some(ThumbSource::Managed(file_name)),
+                        (None, None) => None,
+                    };
+                    rows.push(SidebarRow {
+                        id: None,
+                        title: example.display_title().to_string(),
+                        thumb,
+                    });
+                }
+                for row in self.store.rows() {
+                    rows.push(SidebarRow {
+                        id: Some(row.id),
+                        title: row.display_title().to_string(),
+                        thumb: row.image_file_name().map(ThumbSource::Managed),
+                    });
+                }
 
                 let mut clicked: Option<Option<i64>> = None;
+                let mut edit_start: Option<Option<i64>> = None;
+                let mut edit_result: Option<InlineEditResult> = None;
                 let mut insert_at: Option<(i64, usize)> = None;
                 let mut drag_stopped = false;
-                // 收集每一行的矩形：落点要相对**所有行**判断，而 `dragged()` 只在被拖那一行为真，
-                // 所以不能像以前那样只看被拖行自己的 `rect` / `index`。
-                let mut row_rects: Vec<Rect> = Vec::with_capacity(row_count);
+                // 收集每一行的矩形：落点要相对所有行判断，而 dragged() 只在被拖那一行为真。
+                // 草稿行不参与重排，因此不进 row_rects（下标也要与 store.rows() 对齐）。
+                let mut row_rects: Vec<Rect> = Vec::with_capacity(rows.len());
 
-                let scroll = ScrollArea::vertical()
+                ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (id, title, image_file) in rows.iter() {
-                            let selected = Some(*id) == current_id;
+                        for row in rows.iter() {
+                            let is_draft = row.id.is_none();
+                            let selected = row.id == current_id;
                             let width = (ui.available_width() - 8.0).max(60.0);
-                            let (rect, response) = ui
-                                .allocate_exact_size(Vec2::new(width, 52.0), Sense::click_and_drag());
-                            row_rects.push(rect);
+                            let (rect, response) = ui.allocate_exact_size(
+                                Vec2::new(width, 52.0),
+                                Sense::click_and_drag(),
+                            );
+                            if !is_draft {
+                                row_rects.push(rect);
+                            }
 
-                            // 长按判定：按住超过 REORDER_HOLD 且产生位移，才进入重排。
-                            if response.drag_started() {
-                                self.drag_row_id = Some(*id);
-                                self.drag_started = Instant::now();
-                                self.drag_moved = false;
-                                self.drag_target = None;
+                            // 标题子矩形的命中判定；绘制与判定共用同一函数，保证一致（§2）。
+                            let text_rect = sidebar_row_text_rect(rect);
+                            let pointer_on_title = ui
+                                .ctx()
+                                .pointer_hover_pos()
+                                .map_or(false, |pos| text_rect.contains(pos));
+                            let editing_this = self
+                                .editing_title
+                                .as_ref()
+                                .map_or(false, |edit| edit.target == row.id);
+
+                            if is_draft {
+                                if response.clicked() && !editing_this {
+                                    clicked = Some(row.id);
+                                }
+                            } else {
+                                // 长按判定：按住超过 REORDER_HOLD 且产生位移，才进入重排。
+                                if response.drag_started() {
+                                    self.drag_row_id = row.id;
+                                    self.drag_started = Instant::now();
+                                    self.drag_moved = false;
+                                    self.drag_target = None;
+                                }
+                                if response.dragged()
+                                    && response.drag_delta().length() > REORDER_SLOP
+                                {
+                                    self.drag_moved = true;
+                                }
+                                if response.drag_stopped() {
+                                    drag_stopped = true;
+                                }
+                                if response.clicked() && !self.drag_moved && !editing_this {
+                                    // 方案 A（§2）：短按任意行选中；短按已选中行的标题文本进入内联编辑。
+                                    if selected && pointer_on_title {
+                                        edit_start = Some(row.id);
+                                    } else {
+                                        clicked = Some(row.id);
+                                    }
+                                }
                             }
-                            if response.dragged() && response.drag_delta().length() > REORDER_SLOP {
-                                self.drag_moved = true;
-                            }
-                            if response.drag_stopped() {
-                                drag_stopped = true;
-                            }
-                            if response.clicked() && !self.drag_moved {
-                                clicked = Some(Some(*id));
+
+                            // 当前行悬停标题：光标变 I-beam，右侧出现小铅笔（可发现性，§2）。
+                            if selected && pointer_on_title && !editing_this {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
                             }
 
                             paint_sidebar_row(
@@ -655,44 +661,82 @@ impl GalleryView {
                                 rect,
                                 selected,
                                 &response,
-                                title,
-                                image_file.as_deref(),
+                                &row.title,
+                                row.thumb.as_ref(),
                                 &images_dir,
                                 &mut self.cache,
+                                is_draft,
+                                editing_this,
+                                selected && pointer_on_title && !editing_this,
                             );
+
+                            if editing_this {
+                                let edit = self
+                                    .editing_title
+                                    .as_mut()
+                                    .expect("editing_this 蕴含编辑状态存在");
+                                let response = ui.put(
+                                    text_rect,
+                                    TextEdit::singleline(&mut edit.buffer)
+                                        .id(Id::new(("title_inline", row.id)))
+                                        .desired_width(text_rect.width())
+                                        .font(egui::FontId::proportional(13.5)),
+                                );
+                                if edit.needs_focus {
+                                    response.request_focus();
+                                    edit.needs_focus = false;
+                                } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+                                    // Esc 取消；必须排在 lost_focus 之前，否则会被当成确认。
+                                    edit_result = Some(InlineEditResult::Cancel);
+                                } else if response.lost_focus() {
+                                    // Enter 与失焦都确认。
+                                    edit_result = Some(InlineEditResult::Confirm);
+                                }
+                            }
                         }
                         ui.add_space(4.0);
+
+                        // 落点：按键针 y 与所有行的中心线求插入下标（指针上方有几行）。
+                        if self.drag_row_id.is_some() && self.drag_moved {
+                            let held = Instant::now().duration_since(self.drag_started);
+                            if held >= REORDER_HOLD {
+                                if let Some(pos) = ui.ctx().pointer_hover_pos() {
+                                    let row_centers: Vec<f32> =
+                                        row_rects.iter().map(|rect| rect.center().y).collect();
+                                    self.drag_target = Some(drag_insertion_index(
+                                        pos.y,
+                                        ui.min_rect().bottom(),
+                                        &row_centers,
+                                    ));
+                                }
+                            }
+
+                            // 长按拖拽时画一条插入位置指示线：画在真实落点的行边界上。
+                            if let Some(insert) = self.drag_target {
+                                let x_range = row_rects
+                                    .first()
+                                    .map(|rect| rect.x_range())
+                                    .unwrap_or_else(|| ui.min_rect().x_range());
+                                if let Some(y) = insertion_line_y(insert, &row_rects) {
+                                    ui.painter().hline(
+                                        x_range,
+                                        y,
+                                        Stroke::new(2.0, Color32::from_rgb(120, 170, 255)),
+                                    );
+                                }
+                            }
+                        }
                     });
 
-                // 落点：按键针 y 与所有行的中心线求插入下标（指针上方有几行）。
-                if self.drag_row_id.is_some() && self.drag_moved {
-                    let held = Instant::now().duration_since(self.drag_started);
-                    if held >= REORDER_HOLD {
-                        if let Some(pos) = ui.ctx().pointer_hover_pos() {
-                            let row_centers: Vec<f32> =
-                                row_rects.iter().map(|rect| rect.center().y).collect();
-                            self.drag_target =
-                                Some(drag_insertion_index(pos.y, ui.min_rect().bottom(), &row_centers));
-                        }
-                    }
-
-                    // 长按拖拽时画一条插入位置指示线：画在真实落点的行边界上，
-                    // 而不是被拖行自己的边缘，所以目标离被拖行很远时也看得见。
-                    if let Some(insert) = self.drag_target {
-                        let x_range = row_rects
-                            .first()
-                            .map(|rect| rect.x_range())
-                            .unwrap_or_else(|| ui.min_rect().x_range());
-                        if let Some(y) = insertion_line_y(insert, &row_rects) {
-                            ui.painter_at(scroll.inner_rect).hline(
-                                x_range,
-                                y,
-                                Stroke::new(2.0, Color32::from_rgb(120, 170, 255)),
-                            );
-                        }
-                    }
+                // 内联编辑收尾：确认/取消先于切换选中（失焦确认时可能同时点了别的行）。
+                if let Some(target) = edit_start {
+                    self.begin_inline_edit(target);
                 }
-
+                match edit_result {
+                    Some(InlineEditResult::Confirm) => self.commit_inline_edit(),
+                    Some(InlineEditResult::Cancel) => self.editing_title = None,
+                    None => {}
+                }
                 if let Some(target) = clicked {
                     self.select(target);
                 }
@@ -714,6 +758,58 @@ impl GalleryView {
             });
     }
 
+    /// 开始内联编辑当前行的标题：点击标题文本或按 Ctrl+R（§2）。
+    fn begin_inline_edit(&mut self, target: Option<i64>) {
+        let Some(example) = self.current.as_ref() else {
+            return;
+        };
+        if example.id != target {
+            return;
+        }
+        self.editing_title = Some(InlineEdit {
+            target,
+            buffer: example.title.clone(),
+            needs_focus: true,
+        });
+    }
+
+    /// 确认标题内联编辑：已落库示例立即写库（同旧重命名弹窗），草稿只改内存（§2）。
+    fn commit_inline_edit(&mut self) {
+        let Some(edit) = self.editing_title.take() else {
+            return;
+        };
+        if self.current_id() != edit.target {
+            return;
+        }
+        let title = edit.buffer.trim().to_string();
+        match edit.target {
+            Some(id) => match self.store.load(id) {
+                Ok(Some(mut stored)) => {
+                    stored.title = title.clone();
+                    match self.store.update(&mut stored) {
+                        Ok(()) => {
+                            // 只同步标题，保留其它未保存的编辑。
+                            if let Some(current) = self.current.as_mut() {
+                                current.title = title;
+                            }
+                            self.baseline = Some(stored);
+                            self.status = "已重命名".to_string();
+                            self.status_time = f64::NAN;
+                        }
+                        Err(err) => self.set_error(err),
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => self.set_error(err),
+            },
+            None => {
+                if let Some(current) = self.current.as_mut() {
+                    current.title = title;
+                }
+            }
+        }
+    }
+
     /// 长按拖拽重排：把 `from` 移到 `insert` 位置并落库。
     fn move_row(&mut self, from: i64, insert: usize) {
         let mut order: Vec<i64> = self.store.rows().iter().map(|row| row.id).collect();
@@ -731,10 +827,11 @@ impl GalleryView {
     }
 
     fn bottom_bar(&mut self, ui: &mut egui::Ui) {
-        let actions = egui::Panel::bottom("bottom_bar")
+        let resp = egui::Panel::bottom("bottom_bar")
             .show(ui, |ui| {
                 ui.add_space(4.0);
                 let mut actions: Vec<Action> = Vec::new();
+                let mut open_about = false;
                 ui.horizontal(|ui| {
                     let draft = self
                         .current
@@ -757,20 +854,12 @@ impl GalleryView {
                     {
                         actions.push(Action::Save);
                     }
-
                     if ui
                         .add_enabled(self.current.is_some(), egui::Button::new("另存为"))
                         .on_hover_text("复制成一条新示例，原示例保持不变（Ctrl+Shift+S）")
                         .clicked()
                     {
                         actions.push(Action::SaveAs);
-                    }
-                    if ui
-                        .add_enabled(self.current_id().is_some(), egui::Button::new("重命名"))
-                        .on_hover_text("Ctrl+R")
-                        .clicked()
-                    {
-                        actions.push(Action::Rename);
                     }
                     if ui
                         .add_enabled(self.current_id().is_some(), egui::Button::new("删除"))
@@ -780,25 +869,84 @@ impl GalleryView {
                     }
 
                     ui.separator();
-                    let status = self.status_message(ui.ctx());
-                    ui.label(RichText::new(status).color(HEADER_GRAY).size(12.0));
+                    // §4：复制提示词沿用禁用逻辑——五个分区正文全空时置灰。
+                    let clipboard_text = self
+                        .current
+                        .as_ref()
+                        .map(|example| example.sections.join_for_clipboard())
+                        .unwrap_or_default();
+                    let can_copy = !clipboard_text.is_empty();
+                    if ui
+                        .add_enabled(can_copy, egui::Button::new("复制提示词"))
+                        .on_hover_text("只复制五个分区的正文，不含分区标题")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(clipboard_text);
+                        self.set_status(ui.ctx(), "正向提示词已复制到剪贴板".to_string());
+                    }
+                    if ui.button("导出图库…").clicked() {
+                        actions.push(Action::Export);
+                    }
+                    if ui.button("导入图库…").clicked() {
+                        actions.push(Action::Import);
+                    }
+                    if ui.button("打开数据目录").clicked() {
+                        actions.push(Action::OpenDataDir);
+                    }
+
+                    ui.separator();
+                    let status_text = self.status_message(ui.ctx());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // 最右：版本按钮，点开「关于」（§5）。
+                        let version = env!("CARGO_PKG_VERSION");
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(format!("v{version}"))
+                                        .color(HEADER_GRAY)
+                                        .size(12.0),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("关于 Prompt Gallery")
+                            .clicked()
+                        {
+                            open_about = true;
+                        }
+                        // 状态文案占据剩余宽度，窄窗口下自适应截断（§4）。
+                        let width = ui.available_width().max(0.0);
+                        let height = ui.text_style_height(&egui::TextStyle::Body).max(16.0);
+                        ui.add_sized(
+                            [width, height],
+                            egui::Label::new(
+                                RichText::new(status_text).color(HEADER_GRAY).size(12.0),
+                            )
+                            .truncate(),
+                        );
+                    });
                 });
                 ui.add_space(4.0);
+                if open_about {
+                    self.about_open = true;
+                }
                 actions
-            })
-            .inner;
+            });
+        let actions = resp.inner;
 
         for action in actions {
             match action {
                 Action::Save => self.save_current(),
                 Action::SaveAs => self.save_as(),
-                Action::Rename => {
-                    if let Some(example) = &self.current {
-                        self.rename_buffer = example.title.clone();
-                        self.rename_open = true;
-                    }
-                }
                 Action::Delete => self.delete_confirm = true,
+                Action::Export => {
+                    self.export_path = Path::new(&self.data_dir)
+                        .join(archive::default_file_name(now_unix()))
+                        .to_string_lossy()
+                        .to_string();
+                    self.export_open = true;
+                }
+                Action::Import => self.import_dialog(ui.ctx()),
+                Action::OpenDataDir => open_in_explorer(Path::new(&self.data_dir)),
             }
         }
     }
@@ -831,64 +979,169 @@ impl GalleryView {
 
     fn image_box(&mut self, ui: &mut egui::Ui, height: f32) {
         let width = ui.available_width();
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(6), IMAGE_BOX_FILL);
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+        let hovered = response.hovered();
+        let pointer_over = ui
+            .ctx()
+            .pointer_hover_pos()
+            .map_or(false, |pos| rect.contains(pos));
+        // 拖入文件时高亮整框（§1）。
+        let file_drop_hover =
+            ui.ctx().input(|i| !i.raw.hovered_files.is_empty()) && pointer_over;
+        let stroke_color = if file_drop_hover {
+            Color32::from_rgb(120, 170, 255)
+        } else if hovered {
+            Color32::from_gray(120)
+        } else {
+            Color32::from_gray(72)
+        };
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(6),
+            IMAGE_BOX_FILL,
+            Stroke::new(
+                if hovered || file_drop_hover { 2.0 } else { 1.0 },
+                stroke_color,
+            ),
+            StrokeKind::Inside,
+        );
+        if hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
 
-        let image_key = self
+        // 右上角「×」：只解除引用，不删托管文件（§1、ADR-0004）。
+        let remove_rect = Rect::from_min_size(
+            egui::pos2(rect.right() - 26.0, rect.top() + 6.0),
+            Vec2::splat(20.0),
+        );
+        let remove = ui
+            .interact(remove_rect, Id::new("image_remove"), Sense::click())
+            .on_hover_text("移除图片（托管文件保留）");
+        if remove.hovered() || remove.clicked() {
+            ui.painter().rect_filled(
+                remove_rect,
+                CornerRadius::same(4),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+            );
+            ui.painter().text(
+                remove_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "×",
+                egui::FontId::proportional(14.0),
+                Color32::from_gray(210),
+            );
+        }
+
+        let mut hover_text: Option<String> = None;
+        if remove.clicked() {
+            self.pending_image = None;
+            if let Some(example) = self.current.as_mut() {
+                example.image_hash = None;
+                example.image_ext = None;
+            }
+            self.cache.drop_preview();
+            self.set_status(ui.ctx(), "已移除图片引用（托管文件保留）".to_string());
+        } else if response.clicked() {
+            // 整框可点：有无图片都打开文件对话框（§1）。
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("图片", &IMAGE_EXTENSIONS)
+                .pick_file()
+            {
+                self.set_pending_image(ui.ctx(), &path);
+            }
+        }
+
+        // 待入库图片（只记源路径）优先于已入库图片；尚未保存时也能看到预览（ADR-0004）。
+        let pending = self.pending_image.clone();
+        let managed = self
             .current
             .as_ref()
+            .filter(|example| example.is_draft() || example.image_hash.is_some())
             .and_then(|example| example.image_file_name());
-        let path = self
-            .current
-            .as_ref()
-            .and_then(|example| example.image_path(&self.store.images_dir()));
-
-        match (image_key, path) {
-            (Some(key), Some(path)) => match self.cache.preview(ui.ctx(), &key, &path) {
-                Ok(cached) => {
-                    let size = fit_size(cached.aspect(), rect.size() - Vec2::splat(8.0));
-                    let target = Rect::from_center_size(rect.center(), size);
-                    egui::Image::new(&cached.texture)
-                        .fit_to_exact_size(size)
-                        .paint_at(ui, target);
-                    if let Some(hash) = key.split('.').next() {
-                        let short = &hash[..hash.len().min(16)];
-                        ui.interact(target, Id::new("image_preview"), Sense::hover())
-                            .on_hover_text(format!("内容哈希：{short}…\n{key}"));
+        let images_dir = self.store.images_dir();
+        match (&pending, &managed) {
+            (Some(pending), _) => {
+                hover_text = Some(format!(
+                    "待入库：{}（保存时按内容哈希写入 images/）",
+                    pending.label
+                ));
+                match self.cache.preview(ui.ctx(), &pending.key, &pending.path) {
+                    Ok(cached) => {
+                        let target = fit_size(cached.aspect(), rect.size() - Vec2::splat(16.0));
+                        let target = Rect::from_center_size(rect.center(), target);
+                        egui::Image::new(&cached.texture)
+                            .fit_to_exact_size(target.size())
+                            .paint_at(ui, target);
+                    }
+                    Err(err) => {
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("图片无法显示{}", err),
+                            egui::FontId::proportional(13.0),
+                            Color32::from_gray(200),
+                        );
                     }
                 }
-                Err(err) => {
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        format!("图片无法显示\n{err}"),
-                        egui::FontId::proportional(13.0),
-                        Color32::from_gray(190),
-                    );
+            }
+            (None, Some(key)) => {
+                if let Some(hash) = self
+                    .current
+                    .as_ref()
+                    .and_then(|example| example.image_hash.clone())
+                {
+                    let short: String = hash.chars().take(8).collect();
+                    hover_text = Some(format!("内容哈希：{}…", short));
                 }
-            },
-            _ => {
-                let pending = match self.pending_image_size {
-                    Some((w, h)) => format!("已选择图片 {w}×{h}（保存后入库）\n"),
-                    None => String::new(),
-                };
+                match self.cache.preview(ui.ctx(), key, &images_dir.join(key)) {
+                    Ok(cached) => {
+                        let target = fit_size(cached.aspect(), rect.size() - Vec2::splat(16.0));
+                        let target = Rect::from_center_size(rect.center(), target);
+                        egui::Image::new(&cached.texture)
+                            .fit_to_exact_size(target.size())
+                            .paint_at(ui, target);
+                    }
+                    Err(err) => {
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("图片无法显示{}", err),
+                            egui::FontId::proportional(13.0),
+                            Color32::from_gray(200),
+                        );
+                    }
+                }
+            }
+            (None, None) => {
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    format!("{pending}把图片拖到这里，或点上方「选择图片…」"),
-                    egui::FontId::proportional(13.0),
-                    Color32::from_gray(140),
+                    "点击或拖拽本地图片到此处",
+                    egui::FontId::proportional(14.0),
+                    Color32::from_gray(150),
                 );
             }
         }
 
-        ui.painter().rect_stroke(
-            rect,
-            CornerRadius::same(6),
-            Stroke::new(1.0, Color32::from_gray(70)),
-            StrokeKind::Inside,
-        );
+        // 已有图片时叠一层半透明提示，鼠标移入才显示「点击更换图片」（§1）。
+        if hovered && (pending.is_some() || managed.is_some()) {
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius::same(6),
+                Color32::from_rgba_unmultiplied(0, 0, 0, 90),
+            );
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "点击更换图片",
+                egui::FontId::proportional(14.0),
+                Color32::from_gray(235),
+            );
+        }
+
+        if let Some(text) = hover_text {
+            response.on_hover_text(text);
+        }
     }
 
     /// 提示词编辑器：5 个无缝拼接的 TextEdit（ADR-0002）。
@@ -948,65 +1201,39 @@ impl GalleryView {
             });
         }
 
-        // 重命名。
-        if self.rename_open {
+        // 关于（§5：底栏最右的版本按钮打开）。
+        if self.about_open {
             let mut close = false;
-            let mut confirm = false;
-            egui::Modal::new(Id::new("rename_modal")).show(ctx, |ui| {
-                ui.set_width(320.0);
-                ui.heading("重命名示例");
+            egui::Modal::new(Id::new("about_modal")).show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.heading(format!("{APP_TITLE} v{}", env!("CARGO_PKG_VERSION")));
+                ui.add_space(8.0);
+                ui.label(RichText::new("数据目录").color(HEADER_GRAY).size(12.0));
+                ui.monospace(self.data_dir.clone());
                 ui.add_space(6.0);
-                let response = ui.add(
-                    TextEdit::singleline(&mut self.rename_buffer)
-                        .hint_text("示例标题")
-                        .desired_width(f32::INFINITY),
+                ui.label(
+                    RichText::new(format!("归档格式版本 {}", archive::ARCHIVE_VERSION))
+                        .color(HEADER_GRAY)
+                        .size(12.0),
                 );
-                response.request_focus();
-                if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    confirm = true;
-                }
-                ui.add_space(10.0);
+                ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if ui.button("确定").clicked() {
-                        confirm = true;
+                    if ui.button("复制路径").clicked() {
+                        ui.ctx().copy_text(self.data_dir.clone());
+                        self.set_status(ui.ctx(), "数据目录路径已复制".to_string());
                     }
-                    if ui.button("取消").clicked() {
-                        close = true;
+                    if ui.button("打开数据目录").clicked() {
+                        open_in_explorer(Path::new(&self.data_dir));
                     }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("关闭").clicked() {
+                            close = true;
+                        }
+                    });
                 });
             });
-
-            if confirm {
-                let title = self.rename_buffer.trim().to_string();
-                match self.current_id() {
-                    Some(id) => match self.store.load(id) {
-                        Ok(Some(mut stored)) => {
-                            stored.title = title.clone();
-                            match self.store.update(&mut stored) {
-                                Ok(()) => {
-                                    // 只同步标题，保留其它未保存的编辑。
-                                    if let Some(current) = self.current.as_mut() {
-                                        current.title = title;
-                                    }
-                                    self.baseline = Some(stored);
-                                    self.set_status(ctx, "已重命名".to_string());
-                                }
-                                Err(err) => self.set_error(err),
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(err) => self.set_error(err),
-                    },
-                    None => {
-                        if let Some(current) = self.current.as_mut() {
-                            current.title = title;
-                        }
-                    }
-                }
-                close = true;
-            }
             if close {
-                self.rename_open = false;
+                self.about_open = false;
             }
         }
 
@@ -1107,13 +1334,15 @@ impl GalleryView {
     }
 }
 
-/// 底部按钮触发的动作，由闭包收集后在外层统一执行（避免与 `self` 的借用纠缠）。
+/// 底部按钮触发的动作，由闭包收集后在外层统一执行（避免与 self 的借用纠缠）。
 #[derive(Clone, Copy)]
 enum Action {
     Save,
     SaveAs,
-    Rename,
     Delete,
+    Export,
+    Import,
+    OpenDataDir,
 }
 
 // ---------------------------------------------------------------- 自定义控件
@@ -1171,6 +1400,49 @@ fn section_editor(ui: &mut egui::Ui, sections: &mut Sections, index: SectionInde
     });
 }
 
+// ---------------------------------------------------------------- 侧边栏行
+
+/// 待入库图片（Pending Image）：只记源路径，保存时才按内容哈希写入托管目录（ADR-0004）。
+#[derive(Clone)]
+struct PendingImage {
+    path: PathBuf,
+    /// 源文件名，仅用于状态与悬停提示。
+    label: String,
+    /// 纹理缓存 key；同一张图在多次重绘间保持稳定。
+    key: String,
+}
+
+/// 侧边栏标题的内联编辑状态（§2）。
+struct InlineEdit {
+    /// 正在编辑的示例 id；None 表示草稿行。
+    target: Option<i64>,
+    buffer: String,
+    /// 首次显示时请求键盘焦点。
+    needs_focus: bool,
+}
+
+/// 内联编辑的收尾方式。
+#[derive(Clone, Copy)]
+enum InlineEditResult {
+    Confirm,
+    Cancel,
+}
+
+/// 侧边栏一行的快照：草稿行的 id 为 None，它不在 store.rows() 里（§8）。
+struct SidebarRow {
+    id: Option<i64>,
+    title: String,
+    thumb: Option<ThumbSource>,
+}
+
+/// 侧边栏缩略图的来源（快照，避免与 store 的可变借用冲突）。
+enum ThumbSource {
+    /// 托管目录里的文件（images/hash.ext）。
+    Managed(String),
+    /// 待入库图片：缓存 key + 源路径。
+    Pending { key: String, path: PathBuf },
+}
+
 /// 画一整行侧边栏条目：缩略图 + 标题，选中态高亮。
 fn paint_sidebar_row(
     ui: &mut egui::Ui,
@@ -1178,9 +1450,12 @@ fn paint_sidebar_row(
     selected: bool,
     response: &egui::Response,
     title: &str,
-    image_file: Option<&str>,
+    thumb: Option<&ThumbSource>,
     images_dir: &Path,
     cache: &mut ImageCache,
+    draft: bool,
+    editing: bool,
+    show_pencil: bool,
 ) {
     let bg = if selected {
         Color32::from_rgb(48, 62, 88)
@@ -1192,22 +1467,23 @@ fn paint_sidebar_row(
     ui.painter().rect_filled(rect, CornerRadius::same(5), bg);
 
     // 缩略图
-    let thumb_rect = Rect::from_min_size(
-        rect.min + Vec2::new(6.0, 6.0),
-        Vec2::splat(rect.height() - 12.0),
-    );
+    let thumb_rect = sidebar_row_thumb_rect(rect);
     let mut drew_thumb = false;
-    if let Some(file_name) = image_file {
-        if let Some(key) = file_name.split('.').next() {
-            let path = images_dir.join(file_name);
-            if let Ok(cached) = cache.thumbnail(ui.ctx(), key, &path) {
-                let size = fit_size(cached.aspect(), thumb_rect.size());
-                let target = Rect::from_center_size(thumb_rect.center(), size);
-                egui::Image::new(&cached.texture)
-                    .fit_to_exact_size(size)
-                    .paint_at(ui, target);
-                drew_thumb = true;
-            }
+    if let Some(source) = thumb {
+        let decoded = match source {
+            ThumbSource::Managed(file_name) => file_name
+                .split('.')
+                .next()
+                .map(|key| cache.thumbnail(ui.ctx(), key, &images_dir.join(file_name))),
+            ThumbSource::Pending { key, path } => Some(cache.thumbnail(ui.ctx(), key, path)),
+        };
+        if let Some(Ok(cached)) = decoded {
+            let size = fit_size(cached.aspect(), thumb_rect.size());
+            let target = Rect::from_center_size(thumb_rect.center(), size);
+            egui::Image::new(&cached.texture)
+                .fit_to_exact_size(size)
+                .paint_at(ui, target);
+            drew_thumb = true;
         }
     }
     if !drew_thumb {
@@ -1222,27 +1498,66 @@ fn paint_sidebar_row(
         );
     }
 
+    let text_rect = sidebar_row_text_rect(rect);
+
     // 标题：用 painter 直接画，缩略图与标题因此可以在同一行精确对齐。
-    let text_left = thumb_rect.right() + 8.0;
-    let text_rect = Rect::from_min_max(
-        egui::pos2(text_left, rect.top() + 6.0),
+    // 内联编辑时标题交给 TextEdit 画，这里跳过。
+    if !editing {
+        let galley = ui.painter().layout(
+            title.to_string(),
+            egui::FontId::proportional(13.5),
+            if selected {
+                Color32::from_gray(238)
+            } else {
+                Color32::from_gray(210)
+            },
+            text_rect.width(),
+        );
+        ui.painter().galley(
+            egui::pos2(text_rect.left(), text_rect.top()),
+            galley,
+            Color32::PLACEHOLDER,
+        );
+    }
+
+    // 当前行悬停标题：右侧的小铅笔，提示「点标题可改名」（§2 可发现性）。
+    if show_pencil {
+        ui.painter().text(
+            egui::pos2(text_rect.right() - 2.0, text_rect.top() + 7.0),
+            egui::Align2::RIGHT_CENTER,
+            "✎",
+            egui::FontId::proportional(12.0),
+            Color32::from_gray(170),
+        );
+    }
+
+    // 草稿标记（§8）。
+    if draft {
+        ui.painter().text(
+            egui::pos2(rect.right() - 6.0, rect.bottom() - 5.0),
+            egui::Align2::RIGHT_BOTTOM,
+            "草稿",
+            egui::FontId::proportional(10.0),
+            Color32::from_gray(150),
+        );
+    }
+}
+
+/// 侧边栏一行里缩略图所占的子矩形。
+fn sidebar_row_thumb_rect(rect: Rect) -> Rect {
+    Rect::from_min_size(
+        rect.min + Vec2::new(6.0, 6.0),
+        Vec2::splat(rect.height() - 12.0),
+    )
+}
+
+/// 侧边栏一行里标题所占的子矩形；绘制与点击命中判定共用，保证一致（§2）。
+fn sidebar_row_text_rect(rect: Rect) -> Rect {
+    let thumb = sidebar_row_thumb_rect(rect);
+    Rect::from_min_max(
+        egui::pos2(thumb.right() + 8.0, rect.top() + 6.0),
         egui::pos2(rect.right() - 6.0, rect.bottom() - 6.0),
-    );
-    let galley = ui.painter().layout(
-        title.to_string(),
-        egui::FontId::proportional(13.5),
-        if selected {
-            Color32::from_gray(238)
-        } else {
-            Color32::from_gray(210)
-        },
-        text_rect.width(),
-    );
-    ui.painter().galley(
-        egui::pos2(text_left, text_rect.top()),
-        galley,
-        Color32::PLACEHOLDER,
-    );
+    )
 }
 
 // ---------------------------------------------------------------- 重排落点
@@ -1534,5 +1849,173 @@ mod tests {
         assert_eq!(reorder_destination(3, 0, 4), Some(0));
         assert_eq!(reorder_destination(3, 3, 4), None);
         assert_eq!(reorder_destination(3, 4, 4), None);
+    }
+
+    // ------------------------------------------------------------ 0.1.1 新增
+
+    /// 临时数据目录；Drop 时清理，测试 panic 也会清理。
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "prompt-gallery-main-test-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 生成一张真实的 PNG，保证能被内容嗅探与解码器识别。
+    fn sample_png() -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    fn pending_at(path: &Path) -> PendingImage {
+        PendingImage {
+            path: path.to_path_buf(),
+            label: path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            key: format!("pending:{}", path.display()),
+        }
+    }
+
+    fn managed_file_count(store: &Store) -> usize {
+        std::fs::read_dir(store.images_dir())
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    }
+
+    /// §6 边界：选图/拖图只记源路径，不写托管目录（ADR-0004）。
+    #[test]
+    fn selecting_an_image_leaves_the_managed_dir_empty() {
+        let dir = TempDir::new("pending");
+        let store = Store::open_in(dir.0.clone()).unwrap();
+        let source = dir.0.join("source.png");
+        std::fs::write(&source, sample_png()).unwrap();
+
+        let pending = pending_at(&source);
+        assert_eq!(pending.path, source);
+        assert_eq!(managed_file_count(&store), 0);
+    }
+
+    /// §6：保存时才按内容哈希入库，文件内容与源文件一致。
+    #[test]
+    fn save_ingests_pending_image_by_content_hash() {
+        let dir = TempDir::new("ingest");
+        let store = Store::open_in(dir.0.clone()).unwrap();
+        let source = dir.0.join("source.png");
+        let bytes = sample_png();
+        std::fs::write(&source, &bytes).unwrap();
+
+        let (hash, ext) = ingest_pending_image(&store, &pending_at(&source)).unwrap();
+        assert_eq!(ext, "png");
+        let stored = store.images_dir().join(format!("{hash}.{ext}"));
+        assert!(stored.is_file());
+        assert_eq!(std::fs::read(&stored).unwrap(), bytes);
+        assert_eq!(managed_file_count(&store), 1);
+    }
+
+    /// §6 边界 ①：源文件在保存前消失 → 报错，不静默丢图、也不留托管文件。
+    #[test]
+    fn save_fails_when_pending_source_disappeared() {
+        let dir = TempDir::new("missing");
+        let store = Store::open_in(dir.0.clone()).unwrap();
+        let source = dir.0.join("gone.png");
+        assert!(ingest_pending_image(&store, &pending_at(&source)).is_err());
+        assert_eq!(managed_file_count(&store), 0);
+    }
+
+    /// §6 边界 ②：同样内容只入库一份（另存为时不重复写）。
+    #[test]
+    fn same_content_is_stored_once() {
+        let dir = TempDir::new("dedupe");
+        let store = Store::open_in(dir.0.clone()).unwrap();
+        let bytes = sample_png();
+        let a = dir.0.join("a.png");
+        let b = dir.0.join("b.png");
+        std::fs::write(&a, &bytes).unwrap();
+        std::fs::write(&b, &bytes).unwrap();
+
+        let first = ingest_pending_image(&store, &pending_at(&a)).unwrap();
+        let second = ingest_pending_image(&store, &pending_at(&b)).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(managed_file_count(&store), 1);
+    }
+
+    /// §8：草稿落库到列表顶部，导入仍追加到末尾（有意的不对称）。
+    #[test]
+    fn draft_saves_to_top_while_import_appends() {
+        let dir = TempDir::new("top");
+        let mut store = Store::open_in(dir.0.clone()).unwrap();
+        let ids = |store: &Store| -> Vec<i64> {
+            store.rows().iter().map(|row| row.id).collect()
+        };
+
+        let mut first = Example::draft(0);
+        first.title = "A".to_string();
+        let first_id = store.insert(&mut first).unwrap();
+        let mut second = Example::draft(0);
+        second.title = "B".to_string();
+        let second_id = store.insert(&mut second).unwrap();
+        assert_eq!(ids(&store), vec![first_id, second_id]);
+
+        let mut draft = Example::draft(0);
+        draft.title = "D".to_string();
+        let draft_id = store.insert_at_top(&mut draft).unwrap();
+        assert_eq!(draft.position, 0);
+        assert_eq!(ids(&store), vec![draft_id, first_id, second_id]);
+
+        let mut imported = Example::draft(0);
+        imported.title = "E".to_string();
+        let imported_id = store.insert(&mut imported).unwrap();
+        assert_eq!(ids(&store), vec![draft_id, first_id, second_id, imported_id]);
+    }
+
+    /// 连续两次落库草稿：最新保存的始终在最上，且 position 保持连续。
+    #[test]
+    fn consecutive_drafts_stack_at_the_top() {
+        let dir = TempDir::new("stack");
+        let mut store = Store::open_in(dir.0.clone()).unwrap();
+
+        let mut a = Example::draft(0);
+        a.title = "A".to_string();
+        let a_id = store.insert(&mut a).unwrap();
+        let mut b = Example::draft(0);
+        b.title = "B".to_string();
+        let b_id = store.insert_at_top(&mut b).unwrap();
+        let mut c = Example::draft(0);
+        c.title = "C".to_string();
+        let c_id = store.insert_at_top(&mut c).unwrap();
+
+        let order: Vec<i64> = store.rows().iter().map(|row| row.id).collect();
+        assert_eq!(order, vec![c_id, b_id, a_id]);
+        let positions: Vec<i64> = order
+            .iter()
+            .map(|id| store.load(*id).unwrap().unwrap().position)
+            .collect();
+        assert_eq!(positions, vec![0, 1, 2]);
     }
 }
