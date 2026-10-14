@@ -3,7 +3,40 @@
 Prompt Gallery 的所有重要变更都记录在此。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.1.1] - 2026-10-14
+## [v0.1.2] - 2026-10-14
+
+一次**交互根因修复** + 侧边栏入口重排：长按拖动改为**从指针物理按下的瞬间计时**（此前按住不动永远无法进入拖动）；拖动新增**整行虚影**与**边缘自动滚动**；侧边栏顶部的「示例 N」计数区换成**固定的 `+新示例` 行**。
+
+### 新增
+
+- **拖动虚影（Drag Ghost）**——长按达标（280ms）的瞬间，被拖行以约 85% 不透明度的整行副本（缩略图 + 标题 + 该行自身底色）上浮 2–4pt 并淡入，之后 1:1 跟手；源行原位保留约 35% 不透明度的淡占位，列表不塌陷；虚影画在 `Order::Foreground` 独立图层，不被 `ScrollArea` 裁剪、盖住相邻行；插入蓝线 2pt `rgb(120,170,255)` 仍画在虚影下层。`paint_sidebar_row` 新增 `opacity` / `elevated` 参数，虚影与源行淡占位复用同一套绘制。
+- **边缘自动滚动**——虚影已出的前提下，指针进入列表视口上下各 20pt 的热区即持续滚动：内缘约 4pt/帧、贴边约 16pt/帧（60fps ≈ 240–960pt/s）；指针静止在热区也继续滚，离开热区即停，滚到首/尾即停、不越界不循环；拖动期间每帧重算落点。
+- **侧边栏顶部固定的 `+新示例` 行**——始终可见、不随列表滚动、不可拖动、不参与落点计算、永不高亮为选中蓝；与普通行同尺寸但不显示缩略图，文案左对齐，悬停提示「新建示例（草稿）：保存时才落库」；空列表也始终显示。
+
+### 变更
+
+- **长按判定改为从指针物理按下计时（根因修复）**——旧实现把计时锚点放在 `response.drag_started()` 上（egui 判定「开始拖动」需要先有位移），于是**按住不动时计时器根本不启动**，且落点只在 `response.dragged()` 门控下才计算；按住超过 0.8s 后 `response.clicked()` 也不成立，松手后毫无反应。现在改用 `i.pointer.press_start_time()` 作锚点，并自建手势状态机（`Waiting` / `Armed` / `Cancelled`）：达标前累计位移超过 6pt 即取消本次长按，达标后位移超过 4pt 才进入「重排中」。`REORDER_HOLD` 保持 280ms、`REORDER_SLOP` 保持 4pt。（ADR-0005）
+- **松手语义收紧**——原地松手与空操作（`reorder_destination` 返回 `None`）只做「选中」，不再调用 `move_row`；达标前位移超限的手势既不重排也不选中。
+- **拖动与内联编辑互斥**——标题正在内联编辑的行不允许发起拖动，其它行不受影响。
+- **删除侧边栏「示例 N」计数区**——连同其 `ui.separator()` 整块移除，列表从侧边栏顶部开始。
+- **版本号** `0.1.1` → `0.1.2`。（`Cargo.toml`）
+
+### 测试
+
+- 新增 6 个单测锁住手势状态机与自动滚动：`long_press_cancels_when_moved_before_hold`、`long_press_arms_at_hold_even_without_movement`、`reorder_needs_slop_after_arming`、`release_outcomes_follow_the_gesture_phase`、`autoscroll_speed_curve_and_direction`、`autoscroll_speed_matches_the_two_reference_points`。
+- 拖拽落点测试新增越界语义用例 `drag_insertion_index_clamps_outside_the_viewport`（指针在视口上方一律第 0 位、下方一律末尾，即使列表已滚动）。
+- `cargo test` 全绿：核心库 11 + `src/main.rs` 19 + 验收 1 = **31 项通过**，零 warning。
+
+### 文档
+
+- `README.md`：长按措辞改为「按住不动约 0.28 秒」（达标前移动会取消），补固定 `+新示例` 行与边缘自动滚动，版本号与测试项数同步更新。
+- `docs/ui-layout-map.md`：以实机截图重新测量，删去计数区、补入固定 `+新示例` 行与虚影 / 自动滚动的图层说明。
+
+### 兼容性
+
+- 数据库 schema（`SCHEMA_VERSION = 1`）与归档格式（`ARCHIVE_VERSION = 1`）**均未改变**，0.1.1 的数据目录与导出包可直接使用。
+
+## [v0.1.1] - 2026-10-14
 
 一次界面重构：**顶栏整块删除**，选图并入图片框、改名并入侧边栏；四个图库按钮移到**底栏**；图片改为**保存时才入库**；**草稿成为侧边栏置顶的一行**。
 
@@ -47,7 +80,7 @@ Prompt Gallery 的所有重要变更都记录在此。
 - 数据库 schema（`SCHEMA_VERSION = 1`）与归档格式（`ARCHIVE_VERSION = 1`）**均未改变**，0.1.0 的数据目录与导出包可直接使用。
 - 新增的 `Store::insert_at_top()` 只影响草稿落库路径，旧数据（`position` 从 0 连续排列）不受影响。
 
-## [0.1.0]
+## [v0.1.0] - 2026-10-12
 
 首个版本。
 

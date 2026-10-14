@@ -15,7 +15,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use eframe::egui;
 use egui::{
@@ -40,10 +40,24 @@ const HEADER_GRAY: Color32 = Color32::from_gray(150);
 const SEAM_COLOR: Color32 = Color32::from_gray(72);
 /// 图片框背景。
 const IMAGE_BOX_FILL: Color32 = Color32::from_rgb(28, 30, 34);
-/// 「长按拖拽重排」的判定时间（§3.2：280ms，比旧值更迟钝，避免误触重排）。
+/// 「长按拖动」达标时间：从指针**物理按下**时刻计时（§1，ADR-0005）。
 const REORDER_HOLD: Duration = Duration::from_millis(280);
-/// 拖拽产生位移的阈值，用于区分点击与重排。
+/// 达标前允许的最大累计位移；超过即取消本次长按（§1：6pt，ADR-0005）。
+const REORDER_CANCEL_SLOP: f32 = 6.0;
+/// 达标后产生位移、进入「重排中」的阈值（§1：4pt）。
 const REORDER_SLOP: f32 = 4.0;
+/// 拖到列表上 / 下边缘时的自动滚动热区高度（§3：20pt）。
+const AUTOSCROLL_ZONE: f32 = 20.0;
+/// 自动滚动热区内缘速度（§3：约 4pt/帧 ≈ 240pt/s）。
+const AUTOSCROLL_MIN_SPEED: f32 = 240.0;
+/// 自动滚动最大速度（§3：贴到视口边缘约 16pt/帧 ≈ 960pt/s）。
+const AUTOSCROLL_MAX_SPEED: f32 = 960.0;
+/// 虚影达标时的上浮量（§2：2–4pt）。
+const DRAG_GHOST_UPLIFT: f32 = 4.0;
+/// 被拖源行原位淡占位的不透明度（§2：约 35%）。
+const DRAG_SOURCE_OPACITY: f32 = 0.35;
+/// 虚影不透明度（§2：约 85%）。
+const DRAG_GHOST_OPACITY: f32 = 0.85;
 /// 状态文案自动淡出的秒数。
 const STATUS_TTL: f64 = 12.0;
 
@@ -127,11 +141,9 @@ struct GalleryView {
     /// 导出弹窗与路径缓冲区。
     export_open: bool,
     export_path: String,
-    /// 侧边栏拖拽重排状态。
-    drag_row_id: Option<i64>,
-    drag_moved: bool,
-    drag_started: Instant,
-    drag_target: Option<usize>,
+    /// 侧边栏长按拖动的手势状态（§1，替代旧的
+    /// `drag_row_id` / `drag_moved` / `drag_started` / `drag_target`）。
+    row_drag: Option<RowDrag>,
 }
 
 impl GalleryView {
@@ -152,10 +164,7 @@ impl GalleryView {
             pending_select: None,
             export_open: false,
             export_path: String::new(),
-            drag_row_id: None,
-            drag_moved: false,
-            drag_started: Instant::now(),
-            drag_target: None,
+            row_drag: None,
         };
         // 启动后自动选中第一条；空图库则直接给一个草稿，省掉一次点击。
         match view.store.rows().first().map(|row| row.id) {
@@ -454,10 +463,12 @@ impl eframe::App for GalleryView {
         self.tick_status(&ctx);
         self.window_title(&ctx);
 
+        // 拖动中每帧重绘：虚影跟手、热区自动滚动、落点实时重算（§1、§2、§3）。
         if self.editing_title.is_some()
             || self.delete_confirm
             || self.pending_select.is_some()
             || self.about_open
+            || self.row_drag.is_some()
         {
             ctx.request_repaint();
         }
@@ -537,25 +548,21 @@ impl GalleryView {
             .default_size(SIDEBAR_WIDTH)
             .size_range(180.0..=420.0)
             .show(ui, |ui| {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("示例 {}", self.store.row_count()))
-                            .color(HEADER_GRAY)
-                            .size(12.0),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .button("+")
-                            .on_hover_text("新建示例（草稿）：保存时才落库")
-                            .clicked()
-                        {
-                            self.select(None);
-                        }
-                    });
-                });
-                ui.add_space(4.0);
-                ui.separator();
+                // §4：计数块（「示例 N」+ separator）整块删除，列表从面板顶部开始，只留 3pt 内边距。
+                ui.add_space(3.0);
+                // 固定的「+新示例」行：始终可见、不可拖动、不进落点计算、永不高亮为选中蓝。
+                if new_example_row(ui) {
+                    self.select(None);
+                }
+                ui.add_space(3.0);
+                // 固定行与可滚动列表之间的 1pt 分隔线（§4：区分「固定」与「滚动」）。
+                let (seam_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+                ui.painter().hline(
+                    seam_rect.x_range(),
+                    seam_rect.center().y,
+                    Stroke::new(1.0, SEAM_COLOR),
+                );
                 ui.add_space(2.0);
 
                 // 快照一次：遍历期间可能触发选中/新建，避免与 store 的可变借用冲突。
@@ -590,59 +597,97 @@ impl GalleryView {
                 let mut edit_start: Option<Option<i64>> = None;
                 let mut edit_result: Option<InlineEditResult> = None;
                 let mut insert_at: Option<(i64, usize)> = None;
-                let mut drag_stopped = false;
-                // 收集每一行的矩形：落点要相对所有行判断，而 dragged() 只在被拖那一行为真。
-                // 草稿行不参与重排，因此不进 row_rects（下标也要与 store.rows() 对齐）。
+                // 收集每一行的矩形：落点要相对所有行判断（草稿行不参与重排，不进 row_rects）。
                 let mut row_rects: Vec<Rect> = Vec::with_capacity(rows.len());
+                // 本帧指针物理按下所在的行：长按手势的起点（§1，ADR-0005）。
+                let mut down_on: Option<(i64, Rect)> = None;
+                // 被拖源行的本帧矩形：淡占位与「松手是否落在标题上」判定共用。
+                let mut source_rect: Option<Rect> = None;
+                // 松手结果，待 ScrollArea 渲染完后再派发（避免与 self 的借用纠缠）。
+                let mut release: Option<(i64, GestureOutcome, Option<usize>)> = None;
+                let ctx = ui.ctx().clone();
 
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        // 滚动视口：热区与越界落点判定都要用它（§3）。
+                        let viewport = ui.clip_rect();
+                        let (
+                            pointer_down,
+                            released,
+                            pressed_now,
+                            press_start,
+                            press_origin,
+                            drag_delta,
+                            now,
+                            dt,
+                        ) = ctx.input(|i| {
+                            (
+                                i.pointer.primary_down(),
+                                i.pointer.primary_released(),
+                                i.pointer.primary_pressed(),
+                                i.pointer.press_start_time(),
+                                i.pointer.press_origin(),
+                                i.pointer.total_drag_delta(),
+                                i.time,
+                                i.stable_dt,
+                            )
+                        });
+                        let pointer_pos = ctx.pointer_latest_pos();
+
                         for row in rows.iter() {
                             let is_draft = row.id.is_none();
                             let selected = row.id == current_id;
                             let width = (ui.available_width() - 8.0).max(60.0);
-                            let (rect, response) = ui.allocate_exact_size(
-                                Vec2::new(width, 52.0),
-                                Sense::click_and_drag(),
-                            );
+                            // 只声明 click 语义：长按手势由本文件自建状态机驱动，
+                            // 不依赖 egui 的拖动判定（§1，ADR-0005）。
+                            let (rect, response) =
+                                ui.allocate_exact_size(Vec2::new(width, 52.0), Sense::click());
                             if !is_draft {
                                 row_rects.push(rect);
                             }
 
                             // 标题子矩形的命中判定；绘制与判定共用同一函数，保证一致（§2）。
                             let text_rect = sidebar_row_text_rect(rect);
-                            let pointer_on_title = ui
-                                .ctx()
-                                .pointer_hover_pos()
-                                .map_or(false, |pos| text_rect.contains(pos));
+                            let pointer_on_title =
+                                pointer_pos.map_or(false, |pos| text_rect.contains(pos));
                             let editing_this = self
                                 .editing_title
                                 .as_ref()
                                 .map_or(false, |edit| edit.target == row.id);
+                            let dragging_this = self
+                                .row_drag
+                                .as_ref()
+                                .map_or(false, |drag| Some(drag.row_id) == row.id);
+                            let ghosting_this = dragging_this
+                                && self
+                                    .row_drag
+                                    .as_ref()
+                                    .map_or(false, |drag| drag.phase == LongPress::Armed);
 
                             if is_draft {
                                 if response.clicked() && !editing_this {
                                     clicked = Some(row.id);
                                 }
                             } else {
-                                // 长按判定：按住超过 REORDER_HOLD 且产生位移，才进入重排。
-                                if response.drag_started() {
-                                    self.drag_row_id = row.id;
-                                    self.drag_started = Instant::now();
-                                    self.drag_moved = false;
-                                    self.drag_target = None;
+                                let row_id = row.id.expect("非草稿行必有 id");
+                                if dragging_this {
+                                    source_rect = Some(rect);
                                 }
-                                if response.dragged()
-                                    && response.drag_delta().length() > REORDER_SLOP
+                                // 手势起点 = 指针物理按下落在本行（§1，ADR-0005）；
+                                // 正在内联编辑的行禁止发起拖动（§1 互斥）。
+                                // 只认原始指针状态：egui 在按住超过 max_click_duration(0.8s)
+                                // 后会清空 potential_click_id，is_pointer_button_down_on 随之变假
+                                // （egui-0.36.2/src/input_state/mod.rs:1488、interaction.rs:229）。
+                                if down_on.is_none()
+                                    && pressed_now
+                                    && press_origin.is_some_and(|origin| rect.contains(origin))
+                                    && !editing_this
                                 {
-                                    self.drag_moved = true;
+                                    down_on = Some((row_id, rect));
                                 }
-                                if response.drag_stopped() {
-                                    drag_stopped = true;
-                                }
-                                if response.clicked() && !self.drag_moved && !editing_this {
-                                    // 方案 A（§2）：短按任意行选中；短按已选中行的标题文本进入内联编辑。
+                                // 兜底：按下与松手落在同一帧时状态机来不及建立，按普通点击处理。
+                                if response.clicked() && self.row_drag.is_none() && !editing_this {
                                     if selected && pointer_on_title {
                                         edit_start = Some(row.id);
                                     } else {
@@ -651,16 +696,20 @@ impl GalleryView {
                                 }
                             }
 
-                            // 当前行悬停标题：光标变 I-beam，右侧出现小铅笔（可发现性，§2）。
-                            if selected && pointer_on_title && !editing_this {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                            // 当前行悬停标题：光标变 I-beam；拖动中不抢光标（§1、§2）。
+                            if selected
+                                && pointer_on_title
+                                && !editing_this
+                                && self.row_drag.is_none()
+                            {
+                                ctx.set_cursor_icon(egui::CursorIcon::Text);
                             }
 
                             paint_sidebar_row(
                                 ui,
                                 rect,
                                 selected,
-                                &response,
+                                response.hovered(),
                                 &row.title,
                                 row.thumb.as_ref(),
                                 &images_dir,
@@ -668,6 +717,12 @@ impl GalleryView {
                                 is_draft,
                                 editing_this,
                                 selected && pointer_on_title && !editing_this,
+                                if ghosting_this {
+                                    DRAG_SOURCE_OPACITY
+                                } else {
+                                    1.0
+                                },
+                                false,
                             );
 
                             if editing_this {
@@ -696,33 +751,109 @@ impl GalleryView {
                         }
                         ui.add_space(4.0);
 
-                        // 落点：按键针 y 与所有行的中心线求插入下标（指针上方有几行）。
-                        if self.drag_row_id.is_some() && self.drag_moved {
-                            let held = Instant::now().duration_since(self.drag_started);
-                            if held >= REORDER_HOLD {
-                                if let Some(pos) = ui.ctx().pointer_hover_pos() {
-                                    let row_centers: Vec<f32> =
-                                        row_rects.iter().map(|rect| rect.center().y).collect();
-                                    self.drag_target = Some(drag_insertion_index(
-                                        pos.y,
-                                        ui.min_rect().bottom(),
-                                        &row_centers,
-                                    ));
+                        // ---- 长按手势状态机（§1，ADR-0005）：从物理按下计时 ----
+                        let row_centers: Vec<f32> =
+                            row_rects.iter().map(|rect| rect.center().y).collect();
+                        if pointer_down {
+                            if self.row_drag.is_none() {
+                                if let Some((row_id, rect)) = down_on {
+                                    self.row_drag = Some(RowDrag {
+                                        row_id,
+                                        phase: LongPress::Waiting,
+                                        displacement: 0.0,
+                                        displacement_at_arm: 0.0,
+                                        grab_offset: press_origin
+                                            .map_or(Vec2::ZERO, |pos| pos - rect.min),
+                                        row_size: rect.size(),
+                                        insert: None,
+                                        last_pointer: press_origin.unwrap_or(rect.center()),
+                                    });
                                 }
                             }
+                            if let Some(drag) = self.row_drag.as_mut() {
+                                drag.displacement = drag_delta.map_or(0.0, |delta| delta.length());
+                                let elapsed =
+                                    press_start.map_or(0.0, |start| (now - start).max(0.0));
+                                let phase = long_press_transition(
+                                    drag.phase,
+                                    Duration::from_secs_f64(elapsed),
+                                    drag.displacement,
+                                );
+                                if phase == LongPress::Armed && drag.phase != LongPress::Armed {
+                                    drag.displacement_at_arm = drag.displacement;
+                                }
+                                drag.phase = phase;
 
-                            // 长按拖拽时画一条插入位置指示线：画在真实落点的行边界上。
-                            if let Some(insert) = self.drag_target {
-                                let x_range = row_rects
-                                    .first()
-                                    .map(|rect| rect.x_range())
-                                    .unwrap_or_else(|| ui.min_rect().x_range());
-                                if let Some(y) = insertion_line_y(insert, &row_rects) {
-                                    ui.painter().hline(
-                                        x_range,
-                                        y,
-                                        Stroke::new(2.0, Color32::from_rgb(120, 170, 255)),
-                                    );
+                                // 达标即反馈：280ms 一到（即使指针未动）就出虚影并实时重算落点。
+                                if drag.phase == LongPress::Armed {
+                                    if let Some(pos) = pointer_pos {
+                                        drag.last_pointer = pos;
+                                    }
+                                    drag.insert = Some(drag_insertion_index(
+                                        drag.last_pointer.y,
+                                        viewport.top(),
+                                        viewport.bottom(),
+                                        &row_centers,
+                                    ));
+                                    // 热区自动滚动：指针静止也持续滚；指针无坐标时停（§1、§3）。
+                                    if pointer_pos.is_some() {
+                                        let speed = autoscroll_speed(
+                                            drag.last_pointer.y,
+                                            viewport.top(),
+                                            viewport.bottom(),
+                                        );
+                                        if speed != 0.0 {
+                                            ui.scroll_with_delta(Vec2::new(0.0, -speed * dt));
+                                        }
+                                    }
+                                }
+                            }
+                        } else if let Some(drag) = self.row_drag.take() {
+                            if released {
+                                let destination_changes = drag.insert.map_or(false, |insert| {
+                                    drag_source_index(&rows, drag.row_id)
+                                        .and_then(|source| {
+                                            reorder_destination(source, insert, row_rects.len())
+                                        })
+                                        .is_some()
+                                });
+                                let (outcome, insert) = gesture_outcome(
+                                    drag.phase,
+                                    drag.moved(),
+                                    destination_changes,
+                                    drag.insert,
+                                );
+                                release = Some((drag.row_id, outcome, insert));
+                            }
+                        }
+
+                        // 插入蓝线：只在真正会改变顺序的落点显示，且画在虚影下层（§1、§2）。
+                        if let Some(drag) = self.row_drag.as_ref() {
+                            if drag.phase == LongPress::Armed && drag.moved() {
+                                let changes = drag.insert.map_or(false, |insert| {
+                                    drag_source_index(&rows, drag.row_id)
+                                        .and_then(|source| {
+                                            reorder_destination(source, insert, row_rects.len())
+                                        })
+                                        .is_some()
+                                });
+                                if changes {
+                                    if let Some(insert) = drag.insert {
+                                        if let Some(y) = insertion_line_y(insert, &row_rects) {
+                                            let x_range = row_rects
+                                                .first()
+                                                .map(|rect| rect.x_range())
+                                                .unwrap_or_else(|| ui.min_rect().x_range());
+                                            ui.painter().hline(
+                                                x_range,
+                                                y,
+                                                Stroke::new(
+                                                    2.0,
+                                                    Color32::from_rgb(120, 170, 255),
+                                                ),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -737,24 +868,41 @@ impl GalleryView {
                     Some(InlineEditResult::Cancel) => self.editing_title = None,
                     None => {}
                 }
+                // 松手派发（§1）：达标 + 已移动 + 落点改变顺序才重排；否则按选中处理。
+                if let Some((row_id, outcome, insert)) = release {
+                    match outcome {
+                        GestureOutcome::None => {}
+                        GestureOutcome::Click => {
+                            let on_title = ctx
+                                .pointer_latest_pos()
+                                .zip(source_rect)
+                                .map_or(false, |(pos, rect)| {
+                                    sidebar_row_text_rect(rect).contains(pos)
+                                });
+                            if Some(row_id) == current_id && on_title {
+                                self.begin_inline_edit(Some(row_id));
+                            } else {
+                                self.select(Some(row_id));
+                            }
+                        }
+                        GestureOutcome::Select => self.select(Some(row_id)),
+                        GestureOutcome::Reorder => {
+                            if let Some(insert) = insert {
+                                insert_at = Some((row_id, insert));
+                            }
+                        }
+                    }
+                }
+
                 if let Some(target) = clicked {
                     self.select(target);
                 }
-
-                if drag_stopped {
-                    if let (Some(from), Some(insert)) = (self.drag_row_id, self.drag_target) {
-                        if self.drag_moved {
-                            insert_at = Some((from, insert));
-                        }
-                    }
-                    self.drag_row_id = None;
-                    self.drag_target = None;
-                    self.drag_moved = false;
-                }
-
                 if let Some((from, insert)) = insert_at {
                     self.move_row(from, insert);
                 }
+
+                // 拖动虚影与源行淡占位（§2）：Foreground 图层整行副本 + 投影。
+                self.paint_drag_ghost(ui, &rows, source_rect, &images_dir);
             });
     }
 
@@ -824,6 +972,90 @@ impl GalleryView {
         if let Err(err) = self.store.reorder(&order) {
             self.set_error(err);
         }
+    }
+
+    /// 画拖动虚影与被拖源行的淡占位（§2）。
+    ///
+    /// 虚影画在 `Order::Foreground` 的独立图层：既不被 `ScrollArea` 裁剪，
+    /// 也盖住相邻行；插入蓝线画在 `Middle` 图层，因此天然位于虚影下层。
+    fn paint_drag_ghost(
+        &mut self,
+        ui: &mut egui::Ui,
+        rows: &[SidebarRow],
+        source_rect: Option<Rect>,
+        images_dir: &Path,
+    ) {
+        let armed = self
+            .row_drag
+            .as_ref()
+            .map_or(false, |drag| drag.phase == LongPress::Armed);
+        // 达标瞬间的约 120ms 淡入 / 上浮（§2）：未达标时目标为 false，下次拖动从头播。
+        let uplift = ui
+            .ctx()
+            .animate_bool_with_time(Id::new("row_drag_ghost_uplift"), armed, 0.12)
+            * DRAG_GHOST_UPLIFT;
+        if !armed {
+            return;
+        }
+        let Some(drag) = self.row_drag.as_ref() else {
+            return;
+        };
+        let row_id = drag.row_id;
+        let grab_offset = drag.grab_offset;
+        let row_size = drag.row_size;
+        let pointer = drag.last_pointer;
+        let selected = self.current_id() == Some(row_id);
+        let Some(row) = rows.iter().find(|row| row.id == Some(row_id)) else {
+            return;
+        };
+        let title = row.title.clone();
+        let thumb = row.thumb.as_ref();
+
+        // 源行原位：不隐藏、列表不塌陷，只变淡到约 35%（§2）。
+        if let Some(rect) = source_rect {
+            paint_sidebar_row(
+                ui,
+                rect,
+                selected,
+                false,
+                &title,
+                thumb,
+                images_dir,
+                &mut self.cache,
+                false,
+                false,
+                false,
+                DRAG_SOURCE_OPACITY,
+                false,
+            );
+        }
+
+        // 1:1 跟手：虚影左上角 = 指针 − 按下时的行内偏移 − 上浮量（§2）。
+        let ghost_rect =
+            Rect::from_min_size(pointer - grab_offset - Vec2::new(0.0, uplift), row_size);
+        let ctx = ui.ctx().clone();
+        egui::Area::new(Id::new("row_drag_ghost"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .fixed_pos(ghost_rect.min)
+            .show(&ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(ghost_rect.size(), Sense::hover());
+                paint_sidebar_row(
+                    ui,
+                    rect,
+                    selected,
+                    false,
+                    &title,
+                    thumb,
+                    images_dir,
+                    &mut self.cache,
+                    false,
+                    false,
+                    false,
+                    DRAG_GHOST_OPACITY,
+                    true,
+                );
+            });
     }
 
     fn bottom_bar(&mut self, ui: &mut egui::Ui) {
@@ -1443,12 +1675,69 @@ enum ThumbSource {
     Pending { key: String, path: PathBuf },
 }
 
+/// 长按拖动的阶段（§1，ADR-0005）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LongPress {
+    /// 计时未达标：还在等待窗口内，尚未决定是点击还是长按。
+    Waiting,
+    /// 已达标：280ms 一到即进入此态（即使指针尚未移动，也立刻给出虚影反馈）。
+    Armed,
+    /// 达标前累计位移超过 6pt：本次手势取消，之后按住也不再进入拖动。
+    Cancelled,
+}
+
+/// 侧边栏长按拖动的进行中手势（§1，替代旧的
+/// `drag_row_id` / `drag_moved` / `drag_started` / `drag_target`）。
+struct RowDrag {
+    /// 被按下的示例 id。
+    row_id: i64,
+    /// 当前阶段。
+    phase: LongPress,
+    /// 自指针物理按下起的累计位移长度（pt）。
+    displacement: f32,
+    /// 达标瞬间的累计位移：用于「达标后再移动 4pt」的判定。
+    displacement_at_arm: f32,
+    /// 按下点相对行左上角的偏移，虚影因此 1:1 跟手（§2）。
+    grab_offset: Vec2,
+    /// 行尺寸快照（行高固定 52pt）。
+    row_size: Vec2,
+    /// 最近一次真实落点下标；指针无坐标时沿用（§1 越界处理）。
+    insert: Option<usize>,
+    /// 最近一次真实指针位置；指针移出窗口时虚影停在此处（§1）。
+    last_pointer: egui::Pos2,
+}
+
+impl RowDrag {
+    /// 达标后是否已产生足够位移进入「重排中」（§1：4pt）。
+    fn moved(&self) -> bool {
+        reorder_moved(self.phase, self.displacement, self.displacement_at_arm)
+    }
+}
+
+/// 松手时的收尾动作（§1）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GestureOutcome {
+    /// 已取消的手势：不选中、不重排（「按下即快速拖动」的严格语义）。
+    None,
+    /// 未达标松手：按一次普通点击处理（落在标题上则进入内联编辑）。
+    Click,
+    /// 达标但未移动、或落点为原位（空操作）：只选中该行。
+    Select,
+    /// 达标 + 已移动 + 落点改变顺序：重排。
+    Reorder,
+}
+
 /// 画一整行侧边栏条目：缩略图 + 标题，选中态高亮。
+///
+/// `rect` 由调用方给定，因此同一个函数既能画列表里的行，也能画 Foreground
+/// 图层上的虚影；`opacity` 用于被拖源行的淡占位与虚影（§2），
+/// `elevated` 为真时给行底加一层投影（虚影专用）。
+#[allow(clippy::too_many_arguments)]
 fn paint_sidebar_row(
     ui: &mut egui::Ui,
     rect: Rect,
     selected: bool,
-    response: &egui::Response,
+    hovered: bool,
     title: &str,
     thumb: Option<&ThumbSource>,
     images_dir: &Path,
@@ -1456,15 +1745,33 @@ fn paint_sidebar_row(
     draft: bool,
     editing: bool,
     show_pencil: bool,
+    opacity: f32,
+    elevated: bool,
 ) {
     let bg = if selected {
         Color32::from_rgb(48, 62, 88)
-    } else if response.hovered() {
+    } else if hovered {
         Color32::from_gray(46)
+    } else if elevated {
+        // 虚影保持该行自身底色：未选中行平时透明，浮起时给一层浮层底色（§2）。
+        Color32::from_gray(38)
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(5), bg);
+    // 虚影的投影：epaint 没有真模糊，用偏移 + 半透明形状近似（§2）。
+    if elevated {
+        ui.painter().add(
+            egui::epaint::Shadow {
+                offset: [0, 4],
+                blur: 12,
+                spread: 0,
+                color: Color32::from_black_alpha(120),
+            }
+            .as_shape(rect, CornerRadius::same(5)),
+        );
+    }
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(5), with_opacity(bg, opacity));
 
     // 缩略图
     let thumb_rect = sidebar_row_thumb_rect(rect);
@@ -1480,21 +1787,26 @@ fn paint_sidebar_row(
         if let Some(Ok(cached)) = decoded {
             let size = fit_size(cached.aspect(), thumb_rect.size());
             let target = Rect::from_center_size(thumb_rect.center(), size);
+            let alpha = (255.0 * opacity).round().clamp(0.0, 255.0) as u8;
             egui::Image::new(&cached.texture)
                 .fit_to_exact_size(size)
+                .tint(Color32::from_white_alpha(alpha))
                 .paint_at(ui, target);
             drew_thumb = true;
         }
     }
     if !drew_thumb {
-        ui.painter()
-            .rect_filled(thumb_rect, CornerRadius::same(4), Color32::from_gray(58));
+        ui.painter().rect_filled(
+            thumb_rect,
+            CornerRadius::same(4),
+            with_opacity(Color32::from_gray(58), opacity),
+        );
         ui.painter().text(
             thumb_rect.center(),
             egui::Align2::CENTER_CENTER,
             "无图",
             egui::FontId::proportional(11.0),
-            Color32::from_gray(150),
+            with_opacity(Color32::from_gray(150), opacity),
         );
     }
 
@@ -1506,11 +1818,14 @@ fn paint_sidebar_row(
         let galley = ui.painter().layout(
             title.to_string(),
             egui::FontId::proportional(13.5),
-            if selected {
-                Color32::from_gray(238)
-            } else {
-                Color32::from_gray(210)
-            },
+            with_opacity(
+                if selected {
+                    Color32::from_gray(238)
+                } else {
+                    Color32::from_gray(210)
+                },
+                opacity,
+            ),
             text_rect.width(),
         );
         ui.painter().galley(
@@ -1527,7 +1842,7 @@ fn paint_sidebar_row(
             egui::Align2::RIGHT_CENTER,
             "✎",
             egui::FontId::proportional(12.0),
-            Color32::from_gray(170),
+            with_opacity(Color32::from_gray(170), opacity),
         );
     }
 
@@ -1538,9 +1853,50 @@ fn paint_sidebar_row(
             egui::Align2::RIGHT_BOTTOM,
             "草稿",
             egui::FontId::proportional(10.0),
-            Color32::from_gray(150),
+            with_opacity(Color32::from_gray(150), opacity),
         );
     }
+}
+
+/// 固定的「+新示例」行（§4）。
+///
+/// 与普通示例行同尺寸（高 52pt、宽 `available_width - 8.0`），但不显示缩略图，
+/// 文案左对齐到行左内边距、垂直居中；不可拖动、不进落点计算、永不高亮为选中蓝。
+/// 返回本帧是否被点击（点击语义沿用 `self.select(None)`）。
+fn new_example_row(ui: &mut egui::Ui) -> bool {
+    let width = (ui.available_width() - 8.0).max(60.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 52.0), Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same(5),
+        if hovered {
+            Color32::from_gray(46)
+        } else {
+            Color32::TRANSPARENT
+        },
+    );
+    let color = if hovered {
+        Color32::from_gray(210)
+    } else {
+        HEADER_GRAY
+    };
+    let galley = ui.painter().layout_no_wrap(
+        "+新示例".to_string(),
+        egui::FontId::proportional(13.5),
+        color,
+    );
+    ui.painter().galley(
+        egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        color,
+    );
+    response
+        .on_hover_text("新建示例（草稿）：保存时才落库")
+        .clicked()
 }
 
 /// 侧边栏一行里缩略图所占的子矩形。
@@ -1574,16 +1930,112 @@ fn insertion_index(pointer_y: f32, row_centers: &[f32]) -> usize {
         .count()
 }
 
-/// 拖拽落点：按键针 y 与所有行的中心线求插入下标。
-///
-/// `list_bottom_y` 是列表区域的底边；指针落到它下方即视为「插到末尾」——保留原有语义，
-/// 也是「一次把行拖到列表最后」最省事的手势。
-fn drag_insertion_index(pointer_y: f32, list_bottom_y: f32, row_centers: &[f32]) -> usize {
-    if pointer_y > list_bottom_y {
+/// 拖拽落点（§3 越界语义）：指针在列表视口**上方**（含固定「+新示例」行区域）→ 第 0 位；
+/// 在视口**下方** → 末尾；否则按键针 y 与所有行的中心线求插入下标。
+fn drag_insertion_index(
+    pointer_y: f32,
+    viewport_top: f32,
+    viewport_bottom: f32,
+    row_centers: &[f32],
+) -> usize {
+    if pointer_y < viewport_top {
+        0
+    } else if pointer_y > viewport_bottom {
         row_centers.len()
     } else {
         insertion_index(pointer_y, row_centers)
     }
+}
+
+/// 被拖行在**可重排行**中的下标：与 `row_rects` 对齐（草稿行不在其中）。
+fn drag_source_index(rows: &[SidebarRow], row_id: i64) -> Option<usize> {
+    rows.iter()
+        .filter_map(|row| row.id)
+        .position(|id| id == row_id)
+}
+
+/// 长按阶段转移（§1，ADR-0005）：从指针物理按下计时，达标前位移超过 6pt 即取消。
+///
+/// * `phase`：上一帧的阶段；`Cancelled` 与 `Armed` 都是终态。
+/// * `elapsed`：从物理按下起算的时长。
+/// * `displacement`：自按下起累计位移长度（pt）。
+fn long_press_transition(phase: LongPress, elapsed: Duration, displacement: f32) -> LongPress {
+    match phase {
+        LongPress::Cancelled => LongPress::Cancelled,
+        LongPress::Armed => LongPress::Armed,
+        LongPress::Waiting => {
+            if displacement > REORDER_CANCEL_SLOP {
+                // 达标前移动即取消：即使同帧已满时长，也按取消处理。
+                LongPress::Cancelled
+            } else if elapsed >= REORDER_HOLD {
+                LongPress::Armed
+            } else {
+                LongPress::Waiting
+            }
+        }
+    }
+}
+
+/// 达标后是否已产生足够位移进入「重排中」（§1：4pt）。
+///
+/// `at_arm` 是达标瞬间的累计位移，因此「达标时已经移动了几 pt」不会顶替这 4pt。
+fn reorder_moved(phase: LongPress, displacement: f32, at_arm: f32) -> bool {
+    phase == LongPress::Armed && displacement - at_arm > REORDER_SLOP
+}
+
+/// 松手判定（§1）：返回收尾动作与（重排时）落点下标。
+///
+/// 「原地松手 = 选中」「空操作不重排」都由这里统一决定；未达标松手仍按一次普通点击处理。
+fn gesture_outcome(
+    phase: LongPress,
+    moved: bool,
+    destination_changes: bool,
+    insert: Option<usize>,
+) -> (GestureOutcome, Option<usize>) {
+    match phase {
+        LongPress::Cancelled => (GestureOutcome::None, None),
+        LongPress::Waiting => (GestureOutcome::Click, None),
+        LongPress::Armed => {
+            if moved && destination_changes {
+                (GestureOutcome::Reorder, insert)
+            } else {
+                (GestureOutcome::Select, None)
+            }
+        }
+    }
+}
+
+/// 拖到列表视口上 / 下边缘时的自动滚动速度（pt/s；正 = 向列表末尾方向滚）。
+///
+/// 指针在热区内按进入深度线性加速（§3：内缘约 4pt/帧 ≈ 240pt/s、贴边约 16pt/帧 ≈ 960pt/s）；
+/// 指针移出视口则保持满速，让长列表里的「拖到最前 / 最后」也能到达。
+fn autoscroll_speed(pointer_y: f32, viewport_top: f32, viewport_bottom: f32) -> f32 {
+    if pointer_y < viewport_top {
+        return -AUTOSCROLL_MAX_SPEED;
+    }
+    if pointer_y > viewport_bottom {
+        return AUTOSCROLL_MAX_SPEED;
+    }
+    let from_top = pointer_y - viewport_top;
+    if from_top < AUTOSCROLL_ZONE {
+        let t = 1.0 - from_top / AUTOSCROLL_ZONE;
+        return -(AUTOSCROLL_MIN_SPEED + (AUTOSCROLL_MAX_SPEED - AUTOSCROLL_MIN_SPEED) * t);
+    }
+    let from_bottom = viewport_bottom - pointer_y;
+    if from_bottom < AUTOSCROLL_ZONE {
+        let t = 1.0 - from_bottom / AUTOSCROLL_ZONE;
+        return AUTOSCROLL_MIN_SPEED + (AUTOSCROLL_MAX_SPEED - AUTOSCROLL_MIN_SPEED) * t;
+    }
+    0.0
+}
+
+/// 给颜色乘上不透明度（用于被拖源行的淡占位与虚影，§2）。
+fn with_opacity(color: Color32, opacity: f32) -> Color32 {
+    if opacity >= 1.0 {
+        return color;
+    }
+    let a = (color.a() as f32 * opacity.clamp(0.0, 1.0)).round() as u8;
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a)
 }
 
 /// 把插入下标换算成「移除源元素后」应插入的下标；返回 `None` 表示原地松手、顺序不变。
@@ -1748,17 +2200,25 @@ mod tests {
         }
     }
 
+    /// §3 越界落点语义：视口上方（含固定行区域）→ 第 0 位；视口下方 → 末尾。
     #[test]
-    fn drag_insertion_index_keeps_below_list_means_end() {
+    fn drag_insertion_index_clamps_outside_the_viewport() {
         let centers = centers4();
-        let list_bottom = 240.0; // 列表底边（末行 bottom 217 之下）
-        assert_eq!(drag_insertion_index(100.0, list_bottom, &centers), 2);
-        assert_eq!(drag_insertion_index(230.0, list_bottom, &centers), 4);
-        assert_eq!(drag_insertion_index(240.0, list_bottom, &centers), 4); // 正好在底边：不算「下方」
-        assert_eq!(drag_insertion_index(241.0, list_bottom, &centers), 4); // 落到列表下方 => 末尾
-        assert_eq!(drag_insertion_index(9999.0, list_bottom, &centers), 4);
-        assert_eq!(drag_insertion_index(50.0, list_bottom, &[]), 0); // 空列表
-        assert_eq!(drag_insertion_index(9999.0, list_bottom, &[]), 0);
+        let (top, bottom) = (10.0, 240.0);
+        assert_eq!(drag_insertion_index(100.0, top, bottom, &centers), 2);
+        assert_eq!(drag_insertion_index(230.0, top, bottom, &centers), 4);
+        assert_eq!(drag_insertion_index(bottom, top, bottom, &centers), 4); // 正好在底边：不算「下方」
+        assert_eq!(drag_insertion_index(bottom + 1.0, top, bottom, &centers), 4);
+        assert_eq!(drag_insertion_index(9999.0, top, bottom, &centers), 4);
+        assert_eq!(drag_insertion_index(top, top, bottom, &centers), 0); // 正好在顶边：按行中心线算
+        assert_eq!(drag_insertion_index(top - 1.0, top, bottom, &centers), 0); // 视口上方 → 第 0 位
+        assert_eq!(drag_insertion_index(-999.0, top, bottom, &centers), 0);
+        // 即使行中心线落在指针上方（列表已滚动），视口上方也一律第 0 位。
+        let scrolled = vec![-100.0, -50.0, 30.0, 85.0];
+        assert_eq!(insertion_index(0.0, &scrolled), 2);
+        assert_eq!(drag_insertion_index(0.0, top, bottom, &scrolled), 0);
+        assert_eq!(drag_insertion_index(50.0, top, bottom, &[]), 0); // 空列表
+        assert_eq!(drag_insertion_index(9999.0, top, bottom, &[]), 0);
     }
 
     #[test]
@@ -1849,6 +2309,137 @@ mod tests {
         assert_eq!(reorder_destination(3, 0, 4), Some(0));
         assert_eq!(reorder_destination(3, 3, 4), None);
         assert_eq!(reorder_destination(3, 4, 4), None);
+    }
+
+    // ------------------------------------------------------------ 0.1.2 手势状态机
+
+    /// §1 边界：达标前累计位移超过 6pt → 取消；之后按住也不再进入拖动。
+    #[test]
+    fn long_press_cancels_when_moved_before_hold() {
+        let before = REORDER_HOLD - Duration::from_millis(1);
+        // 恰好等于 6pt：不算「超过」，仍在等待窗口。
+        assert_eq!(
+            long_press_transition(LongPress::Waiting, before, REORDER_CANCEL_SLOP),
+            LongPress::Waiting
+        );
+        assert_eq!(
+            long_press_transition(LongPress::Waiting, before, REORDER_CANCEL_SLOP + 1e-3),
+            LongPress::Cancelled
+        );
+        // 同帧既满时长又超过取消阈值：达标前移动即取消优先。
+        assert_eq!(
+            long_press_transition(LongPress::Waiting, REORDER_HOLD, REORDER_CANCEL_SLOP + 1e-3),
+            LongPress::Cancelled
+        );
+        // 取消是终态：继续按住、继续移动都不再达标。
+        assert_eq!(
+            long_press_transition(LongPress::Cancelled, REORDER_HOLD * 10, 0.0),
+            LongPress::Cancelled
+        );
+        assert_eq!(
+            long_press_transition(LongPress::Cancelled, REORDER_HOLD * 10, 500.0),
+            LongPress::Cancelled
+        );
+    }
+
+    /// §1：按住不动满 280ms 即达标（即使指针没动，也要立刻给虚影反馈）。
+    #[test]
+    fn long_press_arms_at_hold_even_without_movement() {
+        assert_eq!(
+            long_press_transition(LongPress::Waiting, REORDER_HOLD - Duration::from_millis(1), 0.0),
+            LongPress::Waiting
+        );
+        assert_eq!(
+            long_press_transition(LongPress::Waiting, REORDER_HOLD, 0.0),
+            LongPress::Armed
+        );
+        // 恰好 6pt 位移 + 满时长：先判定不取消，于是达标。
+        assert_eq!(
+            long_press_transition(LongPress::Waiting, REORDER_HOLD, REORDER_CANCEL_SLOP),
+            LongPress::Armed
+        );
+        // 达标后保持达标。
+        assert_eq!(
+            long_press_transition(LongPress::Armed, REORDER_HOLD * 2, 500.0),
+            LongPress::Armed
+        );
+    }
+
+    /// §1 边界：达标后移动超过 4pt 才算进入「重排中」。
+    #[test]
+    fn reorder_needs_slop_after_arming() {
+        assert!(!reorder_moved(LongPress::Armed, REORDER_SLOP, 0.0));
+        assert!(reorder_moved(LongPress::Armed, REORDER_SLOP + 1e-3, 0.0));
+        // 达标瞬间已经有位移时，从那一刻重新累计 4pt。
+        assert!(!reorder_moved(LongPress::Armed, 6.0, 2.0));
+        assert!(reorder_moved(LongPress::Armed, 6.0 + 1e-3, 2.0));
+        // 未达标 / 已取消都不算「重排中」。
+        assert!(!reorder_moved(LongPress::Waiting, 500.0, 0.0));
+        assert!(!reorder_moved(LongPress::Cancelled, 500.0, 0.0));
+    }
+
+    /// §1：未达标松手 = 点击；达标未移动或空操作 = 选中；只有真正改序才重排。
+    #[test]
+    fn release_outcomes_follow_the_gesture_phase() {
+        assert_eq!(
+            gesture_outcome(LongPress::Waiting, false, false, None),
+            (GestureOutcome::Click, None)
+        );
+        assert_eq!(
+            gesture_outcome(LongPress::Armed, false, true, Some(3)),
+            (GestureOutcome::Select, None)
+        );
+        assert_eq!(
+            gesture_outcome(LongPress::Armed, true, false, Some(1)),
+            (GestureOutcome::Select, None)
+        );
+        assert_eq!(
+            gesture_outcome(LongPress::Armed, true, true, Some(2)),
+            (GestureOutcome::Reorder, Some(2))
+        );
+        // 取消的手势：不选中、不重排（「按下即快速拖动」的严格语义）。
+        assert_eq!(
+            gesture_outcome(LongPress::Cancelled, false, false, None),
+            (GestureOutcome::None, None)
+        );
+        assert_eq!(
+            gesture_outcome(LongPress::Cancelled, true, true, Some(2)),
+            (GestureOutcome::None, None)
+        );
+    }
+
+    /// §3：自动滚动方向与热区曲线（视口中部为 0、上热区为负、下热区为正、视口外满速）。
+    #[test]
+    fn autoscroll_speed_curve_and_direction() {
+        let (top, bottom) = (100.0, 400.0);
+        assert_eq!(autoscroll_speed((top + bottom) / 2.0, top, bottom), 0.0);
+        // 热区内缘（距边缘正好 20pt）：速度归零。
+        assert!(autoscroll_speed(top + AUTOSCROLL_ZONE, top, bottom).abs() < 1e-3);
+        assert!(autoscroll_speed(bottom - AUTOSCROLL_ZONE, top, bottom).abs() < 1e-3);
+        // 上热区：向列表开头方向（负），越深越快。
+        assert!(autoscroll_speed(top, top, bottom) < 0.0);
+        assert!(
+            autoscroll_speed(top + 5.0, top, bottom) < autoscroll_speed(top + 15.0, top, bottom)
+        );
+        // 下热区：方向相反。
+        assert!(autoscroll_speed(bottom, top, bottom) > 0.0);
+        assert!(
+            autoscroll_speed(bottom - 5.0, top, bottom)
+                > autoscroll_speed(bottom - 15.0, top, bottom)
+        );
+        // 视口外保持满速：长列表里「拖到最前 / 最后」也能到达。
+        assert_eq!(autoscroll_speed(top - 50.0, top, bottom), -AUTOSCROLL_MAX_SPEED);
+        assert_eq!(autoscroll_speed(bottom + 50.0, top, bottom), AUTOSCROLL_MAX_SPEED);
+    }
+
+    /// §3 速度曲线锚点：内缘 ≈ 4pt/帧、贴边 ≈ 16pt/帧（60fps 折算 240–960pt/s）。
+    #[test]
+    fn autoscroll_speed_matches_the_two_reference_points() {
+        let (top, bottom) = (100.0, 400.0);
+        let max = autoscroll_speed(bottom, top, bottom);
+        assert!((max - 16.0 * 60.0).abs() < 1e-3);
+        let inner = autoscroll_speed(bottom - AUTOSCROLL_ZONE + 1e-3, top, bottom);
+        assert!((inner - 4.0 * 60.0).abs() < 1.0);
     }
 
     // ------------------------------------------------------------ 0.1.1 新增
