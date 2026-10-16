@@ -30,6 +30,8 @@ use prompt_gallery::model::{
 };
 use prompt_gallery::store::{self, Store};
 
+mod testhook;
+
 /// 窗口标题；同时是应用显示名（CONTEXT.md）。
 const APP_TITLE: &str = "Prompt Gallery";
 /// 侧边栏默认宽度。
@@ -152,6 +154,8 @@ struct GalleryView {
     close_confirm: bool,
     /// 用户已在关窗确认里选择放弃草稿，允许真正关闭。
     close_confirmed: bool,
+    /// 应用内测试钩子（ADR-0008）：仅当环境变量启用且是 debug 构建时为 Some。
+    hook: Option<testhook::TestHook>,
 }
 
 impl GalleryView {
@@ -176,6 +180,7 @@ impl GalleryView {
             autosave_deadline: None,
             close_confirm: false,
             close_confirmed: false,
+            hook: testhook::TestHook::from_env(),
         };
         // 启动后自动选中第一条；空图库则直接给一个草稿，省掉一次点击。
         match view.store.rows().first().map(|row| row.id) {
@@ -533,6 +538,13 @@ fn ingest_pending_image(store: &Store, pending: &PendingImage) -> anyhow::Result
 // ---------------------------------------------------------------- 界面
 
 impl eframe::App for GalleryView {
+    /// 应用内测试钩子（ADR-0008）：在 egui 处理本帧之前注入合成输入、收发指令。
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(hook) = self.hook.as_mut() {
+            hook.tick(ctx, raw_input);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
