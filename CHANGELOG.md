@@ -30,15 +30,11 @@ Prompt Gallery 的所有重要变更都记录在此。
 - 新增 6 个单测：`src/model.rs` 的 `locked_defaults_false_and_is_not_part_of_content_diff`；`src/store.rs` 的 `new_database_has_locked_column_and_version_2`、`old_database_migrates_to_v2_keeping_rows_unlocked`、`locked_rows_reject_update_and_delete_but_reorder_and_unlock_work`；`src/archive.rs` 的 `export_writes_locked_and_old_json_defaults_to_unlocked`、`locked_survives_export_import_roundtrip`。
 - `cargo test` 全绿：核心库 11 → **17** + `src/main.rs` 19 + 验收 1 = **37 项通过**，零 warning；`cargo check --all-targets` 通过。
 
-### 文档
-
-- 新增 `docs/adr/0006-autosave-stored-examples-with-debounce.md`、`docs/adr/0007-example-read-only-lock.md`；ADR-0004 顶部加注「部分被 ADR-0006 取代」。
-- `CONTEXT.md` 新增术语「自动保存 (Autosave)」「锁定 (Locked)」；`docs/ui-layout-map.md` 更新锁图标与图标道、标题上下居中、`+新示例` 居中、底栏「草稿未保存」、标题栏文案；`README.md` 功能与版本同步、补旧库自动升级说明、测试计数不再写死。
-
 ### 兼容性
 
 - 数据库 schema（`SCHEMA_VERSION`）`1` → `2`：旧库首次打开自动加列并置 `user_version = 2`，已有数据不动、全部未锁。
 - 归档格式（`ARCHIVE_VERSION`）**仍为 `1`**：导出 JSON 多一个可选 `locked` 字段——新版读旧包 = 全部未锁，旧版读新包 = 忽略该字段，双向不崩。
+
 ## [v0.1.2] - 2026-10-14
 
 一次**交互根因修复** + 侧边栏入口重排：长按拖动改为**从指针物理按下的瞬间计时**（此前按住不动永远无法进入拖动）；拖动新增**整行虚影**与**边缘自动滚动**；侧边栏顶部的「示例 N」计数区换成**固定的 `+新示例` 行**。
@@ -66,7 +62,6 @@ Prompt Gallery 的所有重要变更都记录在此。
 ### 文档
 
 - `README.md`：长按措辞改为「按住不动约 0.28 秒」（达标前移动会取消），补固定 `+新示例` 行与边缘自动滚动，版本号与测试项数同步更新。
-- `docs/ui-layout-map.md`：以实机截图重新测量，删去计数区、补入固定 `+新示例` 行与虚影 / 自动滚动的图层说明。
 
 ### 兼容性
 
@@ -109,7 +104,6 @@ Prompt Gallery 的所有重要变更都记录在此。
 ### 文档
 
 - 重写 `README.md`：按钮位置、`选择图片…` 已移除、`Ctrl+R` 语义改为内联编辑、保存时入库、版本号与长按 0.28 秒；并把**运行**前置条件（Microsoft Visual C++ 2015–2022 可再发行组件 x64，提供 `VCRUNTIME140.dll`）与对应疑难排查条目补齐，删去与「零外部运行时」矛盾的体积描述。
-- 以实机截图重新测量界面布局（DPI-aware PrintWindow 捕获客户区 1475×950 物理像素、缩放 1.25，逐像素测量后按 1 列 = 6pt、1 行 = 12pt 重绘），删去顶栏相关内容，补入底栏新按钮、关于弹窗与草稿行。
 
 ### 兼容性
 
