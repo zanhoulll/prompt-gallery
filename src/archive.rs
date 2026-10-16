@@ -39,6 +39,9 @@ struct ArchiveExample {
     image: Option<String>,
     /// 只含五个分区的正文，不含分区标题。
     sections: Vec<String>,
+    /// 只读锁（ADR-0007）。旧归档不含该字段时按未锁处理。
+    #[serde(default)]
+    locked: bool,
     created_at: i64,
     updated_at: i64,
 }
@@ -119,6 +122,7 @@ pub fn export(store: &Store, target: &Path) -> Result<usize> {
             sections: (0..SECTION_COUNT)
                 .map(|index| example.sections.get(index).to_string())
                 .collect(),
+            locked: example.locked,
             created_at: example.created_at,
             updated_at: example.updated_at,
         });
@@ -259,6 +263,7 @@ pub fn import(store: &mut Store, source: &Path, mode: ImportMode) -> Result<Impo
         example.sections = sections;
         example.created_at = archived.created_at;
         example.updated_at = archived.updated_at;
+        example.locked = archived.locked;
 
         if let Some(entry) = archived.image.as_deref() {
             let entry = image_file_name_of(entry);
@@ -459,5 +464,53 @@ mod tests {
         assert_eq!(original.title, "原件");
         let titles: Vec<String> = store.rows().iter().map(|r| r.title.clone()).collect();
         assert_eq!(titles, vec!["原件".to_string(), "原件".to_string()]);
+    }
+
+    #[test]
+    fn export_writes_locked_and_old_json_defaults_to_unlocked() {
+        let dir = TempDir::new("locked-archive");
+        let mut store = Store::open_in(dir.join("a")).unwrap();
+        let mut example = Example::draft(0);
+        example.title = "锁定的".into();
+        let id = store.insert(&mut example).unwrap();
+        store.set_locked(id, true).unwrap();
+
+        let zip_path = dir.join("pack.zip");
+        assert_eq!(export(&store, &zip_path).unwrap(), 1);
+        let file = fs::File::open(&zip_path).unwrap();
+        let mut zip = ZipArchive::new(file).unwrap();
+        let mut raw = String::new();
+        zip.by_name(DATA_ENTRY)
+            .unwrap()
+            .read_to_string(&mut raw)
+            .unwrap();
+        assert!(raw.contains("\"locked\": true"), "导出 JSON 应含 locked 字段：{raw}");
+        let data: ArchiveData = serde_json::from_str(&raw).unwrap();
+        assert_eq!(data.archive_version, 1, "archive_version 应保持 1");
+        assert!(data.examples[0].locked);
+
+        // 旧归档（无 locked 字段）应默认为未锁，且不报错。
+        let old = r#"{"id":1,"position":0,"title":"旧","image":null,"sections":["","","","",""],"created_at":0,"updated_at":0}"#;
+        let parsed: ArchiveExample = serde_json::from_str(old).unwrap();
+        assert!(!parsed.locked, "旧 JSON 缺 locked 时应按未锁处理");
+    }
+
+    #[test]
+    fn locked_survives_export_import_roundtrip() {
+        let dir = TempDir::new("locked-roundtrip");
+        let mut store = Store::open_in(dir.join("a")).unwrap();
+        let mut example = Example::draft(0);
+        example.title = "锁定往返".into();
+        let id = store.insert(&mut example).unwrap();
+        store.set_locked(id, true).unwrap();
+
+        let zip_path = dir.join("pack.zip");
+        export(&store, &zip_path).unwrap();
+
+        let mut fresh = Store::open_in(dir.join("b")).unwrap();
+        let report = import(&mut fresh, &zip_path, ImportMode::Append).unwrap();
+        assert_eq!(report.added, 1);
+        let loaded = fresh.load(fresh.rows()[0].id).unwrap().unwrap();
+        assert!(loaded.locked, "锁定状态应随归档导入");
     }
 }

@@ -42,6 +42,8 @@ const SEAM_COLOR: Color32 = Color32::from_gray(72);
 const IMAGE_BOX_FILL: Color32 = Color32::from_rgb(28, 30, 34);
 /// 「长按拖动」达标时间：从指针**物理按下**时刻计时（§1，ADR-0005）。
 const REORDER_HOLD: Duration = Duration::from_millis(280);
+/// 已落库示例的自动保存防抖窗口（ADR-0006）。
+const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// 达标前允许的最大累计位移；超过即取消本次长按（§1：6pt，ADR-0005）。
 const REORDER_CANCEL_SLOP: f32 = 6.0;
 /// 达标后产生位移、进入「重排中」的阈值（§1：4pt）。
@@ -144,6 +146,12 @@ struct GalleryView {
     /// 侧边栏长按拖动的手势状态（§1，替代旧的
     /// `drag_row_id` / `drag_moved` / `drag_started` / `drag_target`）。
     row_drag: Option<RowDrag>,
+    /// 自动保存到点时刻（egui 时间，秒）；None 表示没有待写改动（ADR-0006）。
+    autosave_deadline: Option<f64>,
+    /// 关窗确认弹窗是否打开（仅非空草稿会用到，ADR-0006 D9）。
+    close_confirm: bool,
+    /// 用户已在关窗确认里选择放弃草稿，允许真正关闭。
+    close_confirmed: bool,
 }
 
 impl GalleryView {
@@ -165,6 +173,9 @@ impl GalleryView {
             export_open: false,
             export_path: String::new(),
             row_drag: None,
+            autosave_deadline: None,
+            close_confirm: false,
+            close_confirmed: false,
         };
         // 启动后自动选中第一条；空图库则直接给一个草稿，省掉一次点击。
         match view.store.rows().first().map(|row| row.id) {
@@ -226,6 +237,18 @@ impl GalleryView {
         if id == self.current_id() && self.baseline.is_some() {
             return;
         }
+        if self.current_id().is_some() {
+            // 已落库示例：切换前先把自动保存落库，然后直接切，不弹任何框（ADR-0006）。
+            if !self.flush_now() {
+                return;
+            }
+            match id {
+                Some(id) => self.load_example(id),
+                None => self.create_draft(),
+            }
+            return;
+        }
+        // 草稿：只有非空草稿才需要确认（ADR-0006 D9）。
         if self.dirty() {
             self.pending_select = Some(id);
             return;
@@ -253,6 +276,42 @@ impl GalleryView {
         self.status = format!("错误：{err:#}");
         // 错误消息不自动淡出。
         self.status_time = 0.0;
+    }
+
+    /// 立即把当前已落库示例的未写改动落库（自动保存，ADR-0006）。
+    ///
+    /// 成功返回 true；失败时保留内存内容、把错误写进状态栏并返回 false。
+    /// 草稿不在此列——草稿仍然「点保存才落库」。
+    fn flush_now(&mut self) -> bool {
+        self.autosave_deadline = None;
+        if self.current_id().is_none() {
+            return true;
+        }
+        let locked = self.current.as_ref().map(|e| e.locked).unwrap_or(false);
+        if locked || !self.dirty() {
+            return true;
+        }
+        let store = &mut self.store;
+        let mut result: anyhow::Result<()> = Ok(());
+        if let Some(example) = self.current.as_mut() {
+            example.title = example.title.trim().to_string();
+            result = store.update(example);
+        }
+        match result {
+            Ok(()) => {
+                self.baseline = self.current.clone();
+                true
+            }
+            Err(err) => {
+                self.set_error(err);
+                false
+            }
+        }
+    }
+
+    /// 关窗前是否需要草稿确认：只有非空草稿才算（ADR-0006 D9）。
+    fn draft_protection_needed(&self) -> bool {
+        self.current_id().is_none() && self.dirty()
     }
 
     // ------------------------------------------------------------ 底部动作
@@ -351,21 +410,8 @@ impl GalleryView {
     ///
     /// 这里只读一次源文件做格式/大小校验与尺寸提示；真正的入库发生在保存时。
     fn set_pending_image(&mut self, ctx: &egui::Context, path: &Path) {
-        let size = match std::fs::read(path) {
-            Ok(bytes) => {
-                if store::ext_for_bytes(&bytes).is_none() {
-                    self.set_status(ctx, format!("无法识别的图片格式：{}", path.display()));
-                    return;
-                }
-                if bytes.len() as u64 > MAX_IMAGE_BYTES {
-                    self.set_status(
-                        ctx,
-                        format!("图片过大（{} MB），已拒绝载入", bytes.len() / 1024 / 1024),
-                    );
-                    return;
-                }
-                image_size_of(&bytes)
-            }
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
             Err(err) => {
                 let err = anyhow::Error::new(err)
                     .context(format!("读取图片失败：{}", path.display()));
@@ -373,6 +419,45 @@ impl GalleryView {
                 return;
             }
         };
+        let Some(detected) = store::ext_for_bytes(&bytes) else {
+            self.set_status(ctx, format!("无法识别的图片格式：{}", path.display()));
+            return;
+        };
+        if bytes.len() as u64 > MAX_IMAGE_BYTES {
+            self.set_status(
+                ctx,
+                format!("图片过大（{} MB），已拒绝载入", bytes.len() / 1024 / 1024),
+            );
+            return;
+        }
+        let size = image_size_of(&bytes);
+
+        if self.current_id().is_some() {
+            // 已落库示例：选图即刻入库并写库——它没有「保存时刻」可等（ADR-0006 D3）。
+            if self.current.as_ref().map(|e| e.locked).unwrap_or(false) {
+                self.set_status(ctx, "示例已锁定，无法更换图片".to_string());
+                return;
+            }
+            match self.store.store_image_bytes(&bytes, detected) {
+                Ok((hash, ext)) => {
+                    if let Some(example) = self.current.as_mut() {
+                        example.image_hash = Some(hash);
+                        example.image_ext = Some(ext);
+                    }
+                    self.cache.drop_preview();
+                    self.flush_now();
+                    let hint = match size {
+                        Some((w, h)) => format!("已选择图片 {w}×{h}"),
+                        None => "已选择图片".to_string(),
+                    };
+                    self.set_status(ctx, hint);
+                }
+                Err(err) => self.set_error(err),
+            }
+            return;
+        }
+
+        // 草稿：仍然只记源路径，保存时才入库（ADR-0004）。
         let label = path
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
@@ -391,6 +476,10 @@ impl GalleryView {
     }
 
     fn export_to(&mut self, ctx: &egui::Context) {
+        // 导出前先把自动保存落库（ADR-0006）。
+        if !self.flush_now() {
+            return;
+        }
         let mut target = PathBuf::from(self.export_path.trim());
         if target.as_os_str().is_empty() {
             self.set_error(anyhow::anyhow!("导出路径为空"));
@@ -455,13 +544,33 @@ impl eframe::App for GalleryView {
             self.set_pending_image(&ctx, &path);
         }
 
+        // 自动保存到点：把已落库示例的改动写库（ADR-0006）。
+        if let Some(deadline) = self.autosave_deadline {
+            if ctx.input(|i| i.time) >= deadline {
+                self.flush_now();
+            }
+        }
+
+        // 关窗拦截（ADR-0006 D9）：已落库示例先落库；非空草稿先确认。
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.close_confirmed {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if self.draft_protection_needed() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.close_confirm = true;
+            } else if self.flush_now() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+        }
+
         self.handle_shortcuts(&ctx);
         self.sidebar(ui);
         self.bottom_bar(ui);
         self.central(ui);
         self.dialogs(&ctx);
         self.tick_status(&ctx);
-        self.window_title(&ctx);
 
         // 拖动中每帧重绘：虚影跟手、热区自动滚动、落点实时重算（§1、§2、§3）。
         if self.editing_title.is_some()
@@ -469,6 +578,7 @@ impl eframe::App for GalleryView {
             || self.pending_select.is_some()
             || self.about_open
             || self.row_drag.is_some()
+            || self.close_confirm
         {
             ctx.request_repaint();
         }
@@ -480,20 +590,6 @@ impl GalleryView {
     fn tick_status(&mut self, ctx: &egui::Context) {
         if self.status_time.is_nan() {
             self.status_time = ctx.input(|i| i.time);
-        }
-    }
-
-    /// 窗口标题显示当前示例，便于任务栏识别；有改动时加 `*`。
-    fn window_title(&self, ctx: &egui::Context) {
-        let title = match &self.current {
-            Some(example) => {
-                let mark = if self.dirty() { "*" } else { "" };
-                format!("{mark}{} — {APP_TITLE}", example.display_title())
-            }
-            None => APP_TITLE.to_string(),
-        };
-        if ctx.input(|i| i.viewport().title.as_deref() != Some(title.as_str())) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
         }
     }
 
@@ -512,8 +608,12 @@ impl GalleryView {
         }
         if rename {
             // §2：Ctrl+R 改为当前行的侧边栏内联编辑，不再弹重命名窗。
-            let target = self.current_id();
-            self.begin_inline_edit(target);
+            // 锁定示例禁止改名（ADR-0007）。
+            let locked = self.current.as_ref().map(|e| e.locked).unwrap_or(false);
+            if !locked {
+                let target = self.current_id();
+                self.begin_inline_edit(target);
+            }
         }
     }
 
@@ -583,6 +683,7 @@ impl GalleryView {
                         id: None,
                         title: example.display_title().to_string(),
                         thumb,
+                        locked: false,
                     });
                 }
                 for row in self.store.rows() {
@@ -590,6 +691,7 @@ impl GalleryView {
                         id: Some(row.id),
                         title: row.display_title().to_string(),
                         thumb: row.image_file_name().map(ThumbSource::Managed),
+                        locked: row.locked,
                     });
                 }
 
@@ -597,6 +699,8 @@ impl GalleryView {
                 let mut edit_start: Option<Option<i64>> = None;
                 let mut edit_result: Option<InlineEditResult> = None;
                 let mut insert_at: Option<(i64, usize)> = None;
+                // 点击锁图标的结果，待列表渲染完后再写库（ADR-0007）。
+                let mut lock_toggle: Option<(i64, bool)> = None;
                 // 收集每一行的矩形：落点要相对所有行判断（草稿行不参与重排，不进 row_rects）。
                 let mut row_rects: Vec<Rect> = Vec::with_capacity(rows.len());
                 // 本帧指针物理按下所在的行：长按手势的起点（§1，ADR-0005）。
@@ -637,6 +741,7 @@ impl GalleryView {
 
                         for row in rows.iter() {
                             let is_draft = row.id.is_none();
+                            let locked = row.locked;
                             let selected = row.id == current_id;
                             let width = (ui.available_width() - 8.0).max(60.0);
                             // 只声明 click 语义：长按手势由本文件自建状态机驱动，
@@ -646,6 +751,12 @@ impl GalleryView {
                             if !is_draft {
                                 row_rects.push(rect);
                             }
+
+                            // 锁图标：行右端固定图标道内的一块独占命中区（§3，ADR-0007）。
+                            // 命中该区域时本行的选中、内联编辑、长按拖动全部让位。
+                            let lock_rect = sidebar_row_lock_rect(rect);
+                            let pointer_on_lock =
+                                pointer_pos.map_or(false, |pos| lock_rect.contains(pos));
 
                             // 标题子矩形的命中判定；绘制与判定共用同一函数，保证一致（§2）。
                             let text_rect = sidebar_row_text_rect(rect);
@@ -665,6 +776,22 @@ impl GalleryView {
                                     .as_ref()
                                     .map_or(false, |drag| drag.phase == LongPress::Armed);
 
+                            // 锁图标点击：独占命中区，先于本行的选中/编辑/拖动判定。
+                            if !is_draft && !editing_this {
+                                let lock_response = ui.interact(
+                                    lock_rect,
+                                    Id::new(("lock", row.id)),
+                                    Sense::click(),
+                                );
+                                if lock_response.clicked() {
+                                    lock_toggle =
+                                        Some((row.id.expect("非草稿行必有 id"), !locked));
+                                }
+                                if lock_response.hovered() {
+                                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                            }
+
                             if is_draft {
                                 if response.clicked() && !editing_this {
                                     clicked = Some(row.id);
@@ -683,11 +810,16 @@ impl GalleryView {
                                     && pressed_now
                                     && press_origin.is_some_and(|origin| rect.contains(origin))
                                     && !editing_this
+                                    && !pointer_on_lock
                                 {
                                     down_on = Some((row_id, rect));
                                 }
                                 // 兜底：按下与松手落在同一帧时状态机来不及建立，按普通点击处理。
-                                if response.clicked() && self.row_drag.is_none() && !editing_this {
+                                if response.clicked()
+                                    && self.row_drag.is_none()
+                                    && !editing_this
+                                    && !pointer_on_lock
+                                {
                                     if selected && pointer_on_title {
                                         edit_start = Some(row.id);
                                     } else {
@@ -700,6 +832,7 @@ impl GalleryView {
                             if selected
                                 && pointer_on_title
                                 && !editing_this
+                                && !pointer_on_lock
                                 && self.row_drag.is_none()
                             {
                                 ctx.set_cursor_icon(egui::CursorIcon::Text);
@@ -716,7 +849,15 @@ impl GalleryView {
                                 &mut self.cache,
                                 is_draft,
                                 editing_this,
-                                selected && pointer_on_title && !editing_this,
+                                if is_draft {
+                                    None
+                                } else if locked {
+                                    Some(true)
+                                } else if response.hovered() || pointer_on_lock {
+                                    Some(false)
+                                } else {
+                                    None
+                                },
                                 if ghosting_this {
                                     DRAG_SOURCE_OPACITY
                                 } else {
@@ -879,7 +1020,12 @@ impl GalleryView {
                                 .map_or(false, |(pos, rect)| {
                                     sidebar_row_text_rect(rect).contains(pos)
                                 });
-                            if Some(row_id) == current_id && on_title {
+                            let locked = rows
+                                .iter()
+                                .find(|row| row.id == Some(row_id))
+                                .map_or(false, |row| row.locked);
+                            // 锁定示例只能选中查看，不进内联编辑（ADR-0007）。
+                            if !locked && Some(row_id) == current_id && on_title {
                                 self.begin_inline_edit(Some(row_id));
                             } else {
                                 self.select(Some(row_id));
@@ -899,6 +1045,42 @@ impl GalleryView {
                 }
                 if let Some((from, insert)) = insert_at {
                     self.move_row(from, insert);
+                }
+                // 锁开关写库（ADR-0007）：界面层同步内存，数据库层强制拒绝修改/删除。
+                // 上锁前先把当前示例的未写改动 flush 掉，否则锁上后这些改动再也写不进去（ADR-0006）。
+                if let Some((id, locked)) = lock_toggle {
+                    // flush 失败（磁盘满/文件占用）：取消这次上锁，保留可重试的机会。
+                    let ready = !locked || self.flush_now();
+                    match ready.then(|| self.store.set_locked(id, locked)) {
+                        Some(Err(err)) => self.set_error(err),
+                        Some(Ok(())) => {
+                            for example in [self.current.as_mut(), self.baseline.as_mut()]
+                                .into_iter()
+                                .flatten()
+                            {
+                                if example.id == Some(id) {
+                                    example.locked = locked;
+                                }
+                            }
+                            if locked
+                                && self
+                                    .editing_title
+                                    .as_ref()
+                                    .map_or(false, |edit| edit.target == Some(id))
+                            {
+                                self.editing_title = None;
+                            }
+                            self.set_status(
+                                &ctx,
+                                if locked {
+                                    "已锁定示例".to_string()
+                                } else {
+                                    "已解锁示例".to_string()
+                                },
+                            );
+                        }
+                        None => {}
+                    }
                 }
 
                 // 拖动虚影与源行淡占位（§2）：Foreground 图层整行副本 + 投影。
@@ -1024,7 +1206,7 @@ impl GalleryView {
                 &mut self.cache,
                 false,
                 false,
-                false,
+                None,
                 DRAG_SOURCE_OPACITY,
                 false,
             );
@@ -1051,7 +1233,7 @@ impl GalleryView {
                     &mut self.cache,
                     false,
                     false,
-                    false,
+                    None,
                     DRAG_GHOST_OPACITY,
                     true,
                 );
@@ -1071,6 +1253,11 @@ impl GalleryView {
                         .map(|example| example.is_draft())
                         .unwrap_or(true);
                     let dirty = self.dirty();
+                    let locked = self
+                        .current
+                        .as_ref()
+                        .map(|example| example.locked)
+                        .unwrap_or(false);
                     if draft {
                         if ui
                             .add_enabled(self.current.is_some(), egui::Button::new("保存为新示例"))
@@ -1080,8 +1267,12 @@ impl GalleryView {
                             actions.push(Action::Save);
                         }
                     } else if ui
-                        .add_enabled(dirty, egui::Button::new("保存"))
-                        .on_hover_text("Ctrl+S")
+                        .add_enabled(dirty && !locked, egui::Button::new("保存"))
+                        .on_hover_text(if locked {
+                            "该示例已锁定，无法修改"
+                        } else {
+                            "Ctrl+S"
+                        })
                         .clicked()
                     {
                         actions.push(Action::Save);
@@ -1094,7 +1285,12 @@ impl GalleryView {
                         actions.push(Action::SaveAs);
                     }
                     if ui
-                        .add_enabled(self.current_id().is_some(), egui::Button::new("删除"))
+                        .add_enabled(self.current_id().is_some() && !locked, egui::Button::new("删除"))
+                        .on_hover_text(if locked {
+                            "该示例已锁定，无法删除"
+                        } else {
+                            "删除当前示例（托管图片文件保留）"
+                        })
                         .clicked()
                     {
                         actions.push(Action::Delete);
@@ -1144,6 +1340,21 @@ impl GalleryView {
                             .clicked()
                         {
                             open_about = true;
+                        }
+                        // 版本号左边：仅「非空草稿」时提示尚未落库（§5）。
+                        let draft_unsaved = self
+                            .current
+                            .as_ref()
+                            .map(|example| example.is_draft() && !example.is_blank())
+                            .unwrap_or(false);
+                        if draft_unsaved {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new("草稿未保存").color(HEADER_GRAY).size(12.0),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text("草稿只在保存为新示例后才落库");
                         }
                         // 状态文案占据剩余宽度，窄窗口下自适应截断（§4）。
                         let width = ui.available_width().max(0.0);
@@ -1212,14 +1423,20 @@ impl GalleryView {
     fn image_box(&mut self, ui: &mut egui::Ui, height: f32) {
         let width = ui.available_width();
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
-        let hovered = response.hovered();
+        // 锁定示例：图片框不响应点击、不接受拖入（ADR-0007）。
+        let locked = self
+            .current
+            .as_ref()
+            .map(|example| example.locked)
+            .unwrap_or(false);
+        let hovered = response.hovered() && !locked;
         let pointer_over = ui
             .ctx()
             .pointer_hover_pos()
             .map_or(false, |pos| rect.contains(pos));
         // 拖入文件时高亮整框（§1）。
         let file_drop_hover =
-            ui.ctx().input(|i| !i.raw.hovered_files.is_empty()) && pointer_over;
+            ui.ctx().input(|i| !i.raw.hovered_files.is_empty()) && pointer_over && !locked;
         let stroke_color = if file_drop_hover {
             Color32::from_rgb(120, 170, 255)
         } else if hovered {
@@ -1249,7 +1466,7 @@ impl GalleryView {
         let remove = ui
             .interact(remove_rect, Id::new("image_remove"), Sense::click())
             .on_hover_text("移除图片（托管文件保留）");
-        if remove.hovered() || remove.clicked() {
+        if !locked && (remove.hovered() || remove.clicked()) {
             ui.painter().rect_filled(
                 remove_rect,
                 CornerRadius::same(4),
@@ -1265,13 +1482,17 @@ impl GalleryView {
         }
 
         let mut hover_text: Option<String> = None;
-        if remove.clicked() {
+        if locked {
+            hover_text = Some("🔒 该示例已锁定".to_string());
+        } else if remove.clicked() {
             self.pending_image = None;
             if let Some(example) = self.current.as_mut() {
                 example.image_hash = None;
                 example.image_ext = None;
             }
             self.cache.drop_preview();
+            // 已落库示例没有「保存时刻」：移除引用后立即写库（ADR-0006）。
+            self.flush_now();
             self.set_status(ui.ctx(), "已移除图片引用（托管文件保留）".to_string());
         } else if response.clicked() {
             // 整框可点：有无图片都打开文件对话框（§1）。
@@ -1348,7 +1569,11 @@ impl GalleryView {
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "点击或拖拽本地图片到此处",
+                    if locked {
+                        "🔒 该示例已锁定"
+                    } else {
+                        "点击或拖拽本地图片到此处"
+                    },
                     egui::FontId::proportional(14.0),
                     Color32::from_gray(150),
                 );
@@ -1385,6 +1610,10 @@ impl GalleryView {
             ui.label(RichText::new("没有选中的示例").color(HEADER_GRAY));
             return;
         };
+        let locked = example.locked;
+        let is_stored = !example.is_draft();
+        let ctx = ui.ctx().clone();
+        let mut changed = false;
 
         Frame::new()
             .fill(Color32::from_gray(20))
@@ -1400,11 +1629,29 @@ impl GalleryView {
                         // 铺满编辑区宽度，让五个分区看起来是一个框的内部分栏。
                         ui.set_min_width(ui.available_width());
                         for index in 0..SECTION_COUNT {
-                            section_editor(ui, &mut example.sections, index);
+                            changed |= section_editor(ui, &mut example.sections, index, locked);
                         }
                         ui.add_space(4.0);
                     });
             });
+
+        // 已落库示例：输入停止 500ms 后自动写库（ADR-0006）。
+        // egui 是反应式的：不请求一次将来的重绘，到点那一帧永远不会到来。
+        if is_stored && !locked {
+            if changed {
+                let now = ctx.input(|i| i.time);
+                self.autosave_deadline = Some(now + AUTOSAVE_DEBOUNCE.as_secs_f64());
+                ctx.request_repaint_after(AUTOSAVE_DEBOUNCE);
+            } else {
+                // 失焦即落库（ADR-0006）：焦点离开五分区且仍有未写改动时立刻 flush。
+                let section_focused = ui.memory(|memory| memory.focused()).map_or(false, |id| {
+                    (0..SECTION_COUNT).any(|index| id == Id::new(("section_edit", index)))
+                });
+                if !section_focused && self.dirty() {
+                    self.flush_now();
+                }
+            }
+        }
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -1412,16 +1659,16 @@ impl GalleryView {
         if self.pending_select.is_some() {
             egui::Modal::new(Id::new("unsaved_modal")).show(ctx, |ui| {
                 ui.set_width(320.0);
-                ui.heading("有未保存的改动");
+                ui.heading("草稿尚未保存");
                 ui.add_space(6.0);
-                ui.label("当前示例的改动还没有保存，要如何处理？");
+                ui.label("当前草稿还没有保存为示例，要如何处理？");
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.button("保存并继续").clicked() {
+                    if ui.button("保存为示例").clicked() {
                         self.save_current();
                         self.perform_pending_select();
                     }
-                    if ui.button("放弃改动").clicked() {
+                    if ui.button("放弃草稿").clicked() {
                         self.perform_pending_select();
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1431,6 +1678,39 @@ impl GalleryView {
                     });
                 });
             });
+        }
+
+        // 关窗确认：只有非空草稿会走到这里（ADR-0006 D9）。
+        if self.close_confirm {
+            let mut discard = false;
+            let mut cancel = false;
+            egui::Modal::new(Id::new("close_modal")).show(ctx, |ui| {
+                ui.set_width(320.0);
+                ui.heading("草稿尚未保存");
+                ui.add_space(6.0);
+                ui.label("当前草稿还没有保存为新示例，关窗后改动会丢失。");
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("放弃草稿").clicked() {
+                        discard = true;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+            if discard {
+                // 用户确认放弃：记住已确认，直接请求关窗。
+                self.close_confirm = false;
+                self.close_confirmed = true;
+                self.current = None;
+                self.pending_image = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if cancel {
+                self.close_confirm = false;
+            }
         }
 
         // 关于（§5：底栏最右的版本按钮打开）。
@@ -1580,7 +1860,15 @@ enum Action {
 // ---------------------------------------------------------------- 自定义控件
 
 /// 分区编辑器：一个灰色不可选中的标题 + 一个无边框 TextEdit。
-fn section_editor(ui: &mut egui::Ui, sections: &mut Sections, index: SectionIndex) {
+///
+/// 返回该分区文本框本帧是否被改动（ADR-0006 的自动保存输入）。
+/// `locked` 为真时文本框置灰且不可交互。
+fn section_editor(
+    ui: &mut egui::Ui,
+    sections: &mut Sections,
+    index: SectionIndex,
+    locked: bool,
+) -> bool {
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         // 标题：灰色、左对齐、不可修改、不可选中。
@@ -1607,14 +1895,16 @@ fn section_editor(ui: &mut egui::Ui, sections: &mut Sections, index: SectionInde
         let text = sections
             .get_mut(index)
             .expect("分区下标由 SECTION_COUNT 约束");
-        ui.add(
+        let changed = ui.add_enabled(
+            !locked,
             TextEdit::multiline(text)
                 .id(Id::new(("section_edit", index)))
                 .desired_width(width)
                 .desired_rows(2)
                 .frame(Frame::NONE)
                 .hint_text("（留空）"),
-        );
+        )
+        .changed();
 
         // 分区之间的细分隔线：让五个文本框看起来是一个框的内部分栏，
         // 而不是五个独立控件（ADR-0002）。
@@ -1629,7 +1919,9 @@ fn section_editor(ui: &mut egui::Ui, sections: &mut Sections, index: SectionInde
             );
             ui.add_space(4.0);
         }
-    });
+        changed
+    })
+    .inner
 }
 
 // ---------------------------------------------------------------- 侧边栏行
@@ -1665,6 +1957,8 @@ struct SidebarRow {
     id: Option<i64>,
     title: String,
     thumb: Option<ThumbSource>,
+    /// 只读锁状态（ADR-0007）；草稿行恒为 false。
+    locked: bool,
 }
 
 /// 侧边栏缩略图的来源（快照，避免与 store 的可变借用冲突）。
@@ -1744,7 +2038,8 @@ fn paint_sidebar_row(
     cache: &mut ImageCache,
     draft: bool,
     editing: bool,
-    show_pencil: bool,
+    // 锁图标：None 不画、Some(true) 常显 🔒、Some(false) 悬停显 🔓（§3，ADR-0007）。
+    lock: Option<bool>,
     opacity: f32,
     elevated: bool,
 ) {
@@ -1815,6 +2110,7 @@ fn paint_sidebar_row(
     // 标题：用 painter 直接画，缩略图与标题因此可以在同一行精确对齐。
     // 内联编辑时标题交给 TextEdit 画，这里跳过。
     if !editing {
+        // 换行宽度留出右侧固定图标道（20pt），避免未锁行悬停出现 🔓 时标题重排跳动。
         let galley = ui.painter().layout(
             title.to_string(),
             egui::FontId::proportional(13.5),
@@ -1826,23 +2122,29 @@ fn paint_sidebar_row(
                 },
                 opacity,
             ),
-            text_rect.width(),
+            (text_rect.width() - 20.0).max(20.0),
         );
+        // 垂直居中（§3）：单行标题在 52pt 行高里上下居中。
         ui.painter().galley(
-            egui::pos2(text_rect.left(), text_rect.top()),
+            egui::pos2(
+                text_rect.left(),
+                rect.center().y - galley.size().y * 0.5,
+            ),
             galley,
             Color32::PLACEHOLDER,
         );
     }
 
-    // 当前行悬停标题：右侧的小铅笔，提示「点标题可改名」（§2 可发现性）。
-    if show_pencil {
+    // 锁图标（§3，ADR-0007）：画在右侧固定图标道内、与行上下居中。
+    // 锁定时常显 🔒；未锁定时悬停该行才显 🔓，提示可点击上锁。
+    if let Some(locked) = lock {
+        let icon_rect = sidebar_row_lock_rect(rect);
         ui.painter().text(
-            egui::pos2(text_rect.right() - 2.0, text_rect.top() + 7.0),
-            egui::Align2::RIGHT_CENTER,
-            "✎",
-            egui::FontId::proportional(12.0),
-            with_opacity(Color32::from_gray(170), opacity),
+            icon_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            if locked { "🔒" } else { "🔓" },
+            egui::FontId::proportional(13.0),
+            with_opacity(Color32::from_gray(190), opacity),
         );
     }
 
@@ -1861,7 +2163,7 @@ fn paint_sidebar_row(
 /// 固定的「+新示例」行（§4）。
 ///
 /// 与普通示例行同尺寸（高 52pt、宽 `available_width - 8.0`），但不显示缩略图，
-/// 文案左对齐到行左内边距、垂直居中；不可拖动、不进落点计算、永不高亮为选中蓝。
+/// 文案在行内水平 + 垂直居中（拉宽侧栏后仍居中）；不可拖动、不进落点计算、永不高亮为选中蓝。
 /// 返回本帧是否被点击（点击语义沿用 `self.select(None)`）。
 fn new_example_row(ui: &mut egui::Ui) -> bool {
     let width = (ui.available_width() - 8.0).max(60.0);
@@ -1890,7 +2192,10 @@ fn new_example_row(ui: &mut egui::Ui) -> bool {
         color,
     );
     ui.painter().galley(
-        egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5),
+        egui::pos2(
+            rect.center().x - galley.size().x * 0.5,
+            rect.center().y - galley.size().y * 0.5,
+        ),
         galley,
         color,
     );
@@ -1908,6 +2213,16 @@ fn sidebar_row_thumb_rect(rect: Rect) -> Rect {
 }
 
 /// 侧边栏一行里标题所占的子矩形；绘制与点击命中判定共用，保证一致（§2）。
+/// 锁图标的独占命中区：贴在行右端图标道内、与行同高居中对齐（§3，ADR-0007）。
+fn sidebar_row_lock_rect(rect: Rect) -> Rect {
+    let text_rect = sidebar_row_text_rect(rect);
+    let width = 20.0;
+    Rect::from_min_max(
+        egui::pos2(text_rect.right() - width, rect.center().y - 26.0),
+        egui::pos2(text_rect.right(), rect.center().y + 26.0),
+    )
+}
+
 fn sidebar_row_text_rect(rect: Rect) -> Rect {
     let thumb = sidebar_row_thumb_rect(rect);
     Rect::from_min_max(

@@ -3,6 +3,42 @@
 Prompt Gallery 的所有重要变更都记录在此。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.1.3] - 2026-10-16
+
+一次「让改内容像重命名一样自动落库」+ **示例只读锁**，外加三处界面瑕疵清理：选中行悬停时的铅笔豆腐块、`+新示例` 未居中、标题栏冗长。
+
+### 新增
+
+- **已落库示例自动保存（Autosave）**——标题与五个分区的改动在停止输入 **500ms** 后自动写库；切换示例、文本框失焦、关窗、导出、上锁前强制 flush（失败则取消本次切换 / 关窗 / 上锁并报错）。图片的选入 / 拖入 / 移除**立即写库**。因此已落库示例之间切换**不再弹确认框**；写入平时静默、不弹「已保存」。**草稿不改语义**：仍点「保存为新示例」才落库。（ADR-0006）
+- **示例只读锁（Locked）**——侧边栏每行右端的锁图标：已锁常显 🔒、未锁悬停显 🔓、草稿不显示；图标独占命中区，点一下就切换并即时写库、无二次确认。锁定后标题 / 图片 / 五分区 / 删除全部禁改（底栏「保存」「删除」置灰、五分区灰化只读、图片框点击与拖入被拒、`Ctrl+R` 改名无效），但**拖动排序、选中查看、复制提示词、另存为副本仍然可用**。约束同时在数据库层强制：`Store::update` / `Store::delete` 对 `locked = true` 的行直接返回错误，界面置灰只是表现。（ADR-0007）
+- **旧数据库首次打开自动升级到 schema v2**——migrate 改为三分支：新库建表即带 `locked` 列；v1 旧库执行一次 `ALTER TABLE examples ADD COLUMN locked INTEGER NOT NULL DEFAULT 0`；v2 及以上直接返回。已有示例原样保留并全部视为未锁。
+
+### 变更
+
+- **已落库示例改为选图 / 拖图即入库**——不再等待某个「保存时刻」，选图立刻按 blake3 哈希复制进托管 `images/` 并写 `image_hash`；**草稿仍走 `PendingImage`（保存时才入库）**。此变更**部分取代 ADR-0004**，ADR-0004 已加注记。
+- **窗口标题栏恒为 `Prompt Gallery`**——删除 `window_title()` 与 `ViewportCommand::Title`，示例名与 `*` 脏标记不再进入标题栏；「未保存」信号改为底栏版本号左侧的「**草稿未保存**」，仅在当前是**非空草稿**时显示。（`src/main.rs`）
+- **`+新示例` 文案改为水平 + 垂直居中**——按 `rect.center()` 排版，拉宽侧边栏后仍居中；悬停底色与提示文案不变。（`new_example_row()`）
+- **侧栏行标题改为上下居中**，并为右端锁图标预留 20pt「图标道」（换行宽度收为 `text_rect.width() − 20pt`），避免未锁行悬停出现 🔓 时标题重排跳动。
+- **版本号** `0.1.2` → `0.1.3`。（`Cargo.toml`）
+
+### 修复
+
+- **选中示例悬停时行右端出现小方块**——那是字面 `✎`（U+270E）在 Ubuntu-Light / NotoEmoji / emoji-icon-font / 微软雅黑 上均缺字形而渲染出的豆腐块。直接删除该绘制，不换字形；标题悬停的 I-beam 光标与内联编辑（短按标题 / `Ctrl+R`）保持原样。
+
+### 测试
+
+- 新增 6 个单测：`src/model.rs` 的 `locked_defaults_false_and_is_not_part_of_content_diff`；`src/store.rs` 的 `new_database_has_locked_column_and_version_2`、`old_database_migrates_to_v2_keeping_rows_unlocked`、`locked_rows_reject_update_and_delete_but_reorder_and_unlock_work`；`src/archive.rs` 的 `export_writes_locked_and_old_json_defaults_to_unlocked`、`locked_survives_export_import_roundtrip`。
+- `cargo test` 全绿：核心库 11 → **17** + `src/main.rs` 19 + 验收 1 = **37 项通过**，零 warning；`cargo check --all-targets` 通过。
+
+### 文档
+
+- 新增 `docs/adr/0006-autosave-stored-examples-with-debounce.md`、`docs/adr/0007-example-read-only-lock.md`；ADR-0004 顶部加注「部分被 ADR-0006 取代」。
+- `CONTEXT.md` 新增术语「自动保存 (Autosave)」「锁定 (Locked)」；`docs/ui-layout-map.md` 更新锁图标与图标道、标题上下居中、`+新示例` 居中、底栏「草稿未保存」、标题栏文案；`README.md` 功能与版本同步、补旧库自动升级说明、测试计数不再写死。
+
+### 兼容性
+
+- 数据库 schema（`SCHEMA_VERSION`）`1` → `2`：旧库首次打开自动加列并置 `user_version = 2`，已有数据不动、全部未锁。
+- 归档格式（`ARCHIVE_VERSION`）**仍为 `1`**：导出 JSON 多一个可选 `locked` 字段——新版读旧包 = 全部未锁，旧版读新包 = 忽略该字段，双向不崩。
 ## [v0.1.2] - 2026-10-14
 
 一次**交互根因修复** + 侧边栏入口重排：长按拖动改为**从指针物理按下的瞬间计时**（此前按住不动永远无法进入拖动）；拖动新增**整行虚影**与**边缘自动滚动**；侧边栏顶部的「示例 N」计数区换成**固定的 `+新示例` 行**。
@@ -24,7 +60,7 @@ Prompt Gallery 的所有重要变更都记录在此。
 ### 测试
 
 - 新增 6 个单测锁住手势状态机与自动滚动：`long_press_cancels_when_moved_before_hold`、`long_press_arms_at_hold_even_without_movement`、`reorder_needs_slop_after_arming`、`release_outcomes_follow_the_gesture_phase`、`autoscroll_speed_curve_and_direction`、`autoscroll_speed_matches_the_two_reference_points`。
-- 拖拽落点测试新增越界语义用例 `drag_insertion_index_clamps_outside_the_viewport`（指针在视口上方一律第 0 位、下方一律末尾，即使列表已滚动）。
+- 拖拽落点测试把原 `drag_insertion_index_keeps_below_list_means_end` 用例**替换**为越界语义用例 `drag_insertion_index_clamps_outside_the_viewport`（指针在视口上方一律第 0 位、下方一律末尾，即使列表已滚动）——是替换不是净增，`src/main.rs` 测试数 13 → 19 全部来自上面的 6 个新单测。
 - `cargo test` 全绿：核心库 11 + `src/main.rs` 19 + 验收 1 = **31 项通过**，零 warning。
 
 ### 文档

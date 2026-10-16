@@ -17,7 +17,7 @@ pub const DB_FILE_NAME: &str = "gallery.sqlite3";
 /// 托管图片目录名。
 pub const IMAGES_DIR_NAME: &str = "images";
 /// 当前 schema 版本，写入 SQLite 的 `PRAGMA user_version`。
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// 索引用的轻量条目：侧边栏只需要标题与图片，不必把五个分区文本全读出来。
 #[derive(Clone, Debug)]
@@ -26,6 +26,8 @@ pub struct Row {
     pub title: String,
     pub image_hash: Option<String>,
     pub image_ext: Option<String>,
+    /// 只读锁（ADR-0007）。
+    pub locked: bool,
 }
 
 impl Row {
@@ -118,7 +120,7 @@ impl Store {
         let mut example = self
             .conn
             .query_row(
-                "SELECT id, position, title, image_hash, image_ext, created_at, updated_at
+                "SELECT id, position, title, image_hash, image_ext, locked, created_at, updated_at
                  FROM examples WHERE id = ?1",
                 params![id],
                 |row| {
@@ -129,8 +131,9 @@ impl Store {
                         image_hash: row.get(3)?,
                         image_ext: row.get(4)?,
                         sections: Sections::new(),
-                        created_at: row.get(5)?,
-                        updated_at: row.get(6)?,
+                        locked: row.get(5)?,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
                     })
                 },
             )
@@ -174,6 +177,7 @@ impl Store {
         let title = example.title.trim().to_string();
         let image_hash = example.image_hash.clone();
         let image_ext = example.image_ext.clone();
+        let locked = example.locked;
         let mut position = example.position;
 
         let tx = self.conn.transaction()?;
@@ -185,17 +189,17 @@ impl Store {
         let id = match forced_id {
             Some(id) => {
                 tx.execute(
-                    "INSERT INTO examples (id, position, title, image_hash, image_ext, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                    params![id, position, title, image_hash, image_ext, now],
+                    "INSERT INTO examples (id, position, title, image_hash, image_ext, locked, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                    params![id, position, title, image_hash, image_ext, locked, now],
                 )?;
                 id
             }
             None => {
                 tx.execute(
-                    "INSERT INTO examples (position, title, image_hash, image_ext, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                    params![position, title, image_hash, image_ext, now],
+                    "INSERT INTO examples (position, title, image_hash, image_ext, locked, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                    params![position, title, image_hash, image_ext, locked, now],
                 )?;
                 tx.last_insert_rowid()
             }
@@ -217,6 +221,9 @@ impl Store {
         let Some(id) = example.id else {
             anyhow::bail!("不能更新未落库的草稿");
         };
+        if self.is_locked(id)? {
+            anyhow::bail!("示例已锁定，无法修改");
+        }
         let now = now_unix();
         let title = example.title.trim().to_string();
         let image_hash = example.image_hash.clone();
@@ -241,8 +248,38 @@ impl Store {
 
     /// 删除示例。图片文件是内容寻址、可能被多条示例共享，因此保留不删。
     pub fn delete(&mut self, id: i64) -> Result<()> {
+        if self.is_locked(id)? {
+            anyhow::bail!("示例已锁定，无法删除");
+        }
         self.conn
             .execute("DELETE FROM examples WHERE id = ?1", params![id])?;
+        self.reload_rows()?;
+        Ok(())
+    }
+
+    /// 该示例当前是否已锁定；不存在的 id 视为未锁。
+    fn is_locked(&self, id: i64) -> Result<bool> {
+        let locked = self
+            .conn
+            .query_row(
+                "SELECT locked FROM examples WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?;
+        Ok(locked.unwrap_or(false))
+    }
+
+    /// 开 / 关示例锁（ADR-0007）。
+    ///
+    /// 只写 locked 与 updated_at，故意不走 Store::update——否则会被自身的
+    /// 锁定校验挡住。拖动排序（Store::reorder）不受锁影响。
+    pub fn set_locked(&mut self, id: i64, locked: bool) -> Result<()> {
+        let now = now_unix();
+        self.conn.execute(
+            "UPDATE examples SET locked = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, locked, now],
+        )?;
         self.reload_rows()?;
         Ok(())
     }
@@ -293,7 +330,7 @@ impl Store {
     /// 重新读取侧边栏列表。
     fn reload_rows(&mut self) -> Result<()> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, image_hash, image_ext FROM examples ORDER BY position ASC, id ASC",
+            "SELECT id, title, image_hash, image_ext, locked FROM examples ORDER BY position ASC, id ASC",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -302,6 +339,7 @@ impl Store {
                     title: row.get(1)?,
                     image_hash: row.get(2)?,
                     image_ext: row.get(3)?,
+                    locked: row.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -316,29 +354,42 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version >= SCHEMA_VERSION {
         return Ok(());
     }
-    conn.execute_batch(
-        "BEGIN;
-         CREATE TABLE IF NOT EXISTS examples (
-             id          INTEGER PRIMARY KEY,
-             position    INTEGER NOT NULL DEFAULT 0,
-             title       TEXT    NOT NULL DEFAULT '',
-             image_hash  TEXT,
-             image_ext   TEXT,
-             created_at  INTEGER NOT NULL DEFAULT 0,
-             updated_at  INTEGER NOT NULL DEFAULT 0
-         );
-         CREATE INDEX IF NOT EXISTS idx_examples_position ON examples(position);
-         -- 分区文本按索引 0..4 存行；分区标题是 UI 常量，不入库。
-         CREATE TABLE IF NOT EXISTS sections (
-             example_id INTEGER NOT NULL REFERENCES examples(id) ON DELETE CASCADE,
-             section_index INTEGER NOT NULL,
-             text       TEXT    NOT NULL DEFAULT '',
-             PRIMARY KEY (example_id, section_index)
-         );
-         PRAGMA user_version = 1;
-         COMMIT;",
-    )
-    .context("初始化数据库 schema 失败")?;
+    if version == 0 {
+        // 新库：直接按 v2 的形状建表。
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE IF NOT EXISTS examples (
+                 id          INTEGER PRIMARY KEY,
+                 position    INTEGER NOT NULL DEFAULT 0,
+                 title       TEXT    NOT NULL DEFAULT '',
+                 image_hash  TEXT,
+                 image_ext   TEXT,
+                 locked      INTEGER NOT NULL DEFAULT 0,
+                 created_at  INTEGER NOT NULL DEFAULT 0,
+                 updated_at  INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idx_examples_position ON examples(position);
+             -- 分区文本按索引 0..4 存行；分区标题是 UI 常量，不入库。
+             CREATE TABLE IF NOT EXISTS sections (
+                 example_id INTEGER NOT NULL REFERENCES examples(id) ON DELETE CASCADE,
+                 section_index INTEGER NOT NULL,
+                 text       TEXT    NOT NULL DEFAULT '',
+                 PRIMARY KEY (example_id, section_index)
+             );
+             PRAGMA user_version = 2;
+             COMMIT;",
+        )
+        .context("初始化数据库 schema 失败")?;
+    } else {
+        // 旧库（v1）：只补 locked 列；已有示例全部保持未锁，数据不动，只跑一次。
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE examples ADD COLUMN locked INTEGER NOT NULL DEFAULT 0;
+             PRAGMA user_version = 2;
+             COMMIT;",
+        )
+        .context("升级数据库 schema 到 v2 失败")?;
+    }
     Ok(())
 }
 
@@ -547,6 +598,86 @@ mod tests {
             "断言失败后临时目录仍残留：{}",
             path.display()
         );
+    }
+
+    #[test]
+    fn new_database_has_locked_column_and_version_2() {
+        let dir = TempDir::new("schema-new");
+        let _store = Store::open_in(dir.path().to_path_buf()).unwrap();
+        let conn = Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        // SELECT locked 能跑通即证明列存在。
+        let count: i64 = conn
+            .query_row("SELECT COUNT(locked) FROM examples", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn old_database_migrates_to_v2_keeping_rows_unlocked() {
+        let dir = TempDir::new("schema-old");
+        // TempDir 只算路径、不建目录；手工造库前先建好。
+        fs::create_dir_all(dir.path()).unwrap();
+        let db_path = dir.path().join(DB_FILE_NAME);
+        {
+            // 手工造一个 v1 旧库：没有 locked 列。
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE examples (
+                     id INTEGER PRIMARY KEY, position INTEGER NOT NULL DEFAULT 0,
+                     title TEXT NOT NULL DEFAULT '', image_hash TEXT, image_ext TEXT,
+                     created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE sections (
+                     example_id INTEGER NOT NULL REFERENCES examples(id) ON DELETE CASCADE,
+                     section_index INTEGER NOT NULL, text TEXT NOT NULL DEFAULT '',
+                     PRIMARY KEY (example_id, section_index));
+                 INSERT INTO examples (id, position, title) VALUES (7, 0, '旧示例');
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let store = Store::open_in(dir.path().to_path_buf()).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2, "旧库应升级到 v2");
+        let loaded = store.load(7).unwrap().unwrap();
+        assert_eq!(loaded.title, "旧示例", "迁移不应丢数据");
+        assert!(!loaded.locked, "老示例迁移后应保持未锁");
+        assert_eq!(store.row_count(), 1);
+    }
+
+    #[test]
+    fn locked_rows_reject_update_and_delete_but_reorder_and_unlock_work() {
+        let dir = TempDir::new("lock");
+        let mut store = Store::open_in(dir.path().to_path_buf()).unwrap();
+        let mut a = Example::draft(0);
+        a.title = "A".into();
+        let id = store.insert(&mut a).unwrap();
+
+        store.set_locked(id, true).unwrap();
+        assert!(store.rows()[0].locked);
+
+        let mut loaded = store.load(id).unwrap().unwrap();
+        loaded.title = "改过".into();
+        assert!(store.update(&mut loaded).is_err(), "锁定行不应能更新");
+        assert!(store.delete(id).is_err(), "锁定行不应能删除");
+        assert_eq!(store.load(id).unwrap().unwrap().title, "A", "锁定后内容不应被改");
+        // 拖动排序不受锁影响（ADR-0007）。
+        assert!(store.reorder(&[id]).is_ok());
+
+        store.set_locked(id, false).unwrap();
+        assert!(!store.rows()[0].locked);
+        let mut loaded = store.load(id).unwrap().unwrap();
+        loaded.title = "改过".into();
+        store.update(&mut loaded).unwrap();
+        assert_eq!(store.load(id).unwrap().unwrap().title, "改过");
+        store.delete(id).unwrap();
+        assert_eq!(store.row_count(), 0);
     }
 }
 

@@ -90,6 +90,8 @@ pub struct Example {
     pub sections: Sections,
     pub created_at: i64,
     pub updated_at: i64,
+    /// 只读锁：锁定的示例不能被修改或删除（ADR-0007）。
+    pub locked: bool,
 }
 
 impl Default for Example {
@@ -104,6 +106,7 @@ impl Default for Example {
             sections: Sections::new(),
             created_at: now,
             updated_at: now,
+            locked: false,
         }
     }
 }
@@ -228,5 +231,20 @@ mod tests {
     fn timestamp_is_compact_and_stable() {
         // 2024-01-02 03:04:05 UTC
         assert_eq!(compact_timestamp(1_704_164_645), "20240102-030405");
+    }
+
+    #[test]
+    fn locked_defaults_false_and_is_not_part_of_content_diff() {
+        assert!(!Example::default().locked);
+        assert!(!Example::draft(0).locked);
+
+        let mut example = Example::default();
+        example.id = Some(1);
+        let baseline = example.clone();
+        assert!(!example.differs_from(&baseline));
+
+        // 开关锁不算内容改动（ADR-0007）。
+        example.locked = true;
+        assert!(!example.differs_from(&baseline));
     }
 }
