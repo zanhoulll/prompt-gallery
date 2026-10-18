@@ -1,0 +1,3 @@
+# 示例只读锁：数据层强制 + 界面层置灰
+
+需要一种「防止误改」的示例状态，且「不能修改」必须能被自动验收，不能只靠界面变灰。改为在 `examples` 表新增 `locked INTEGER NOT NULL DEFAULT 0` 列（SCHEMA_VERSION 1→2：v0 新库建表即含该列，v1 旧库 `ALTER TABLE examples ADD COLUMN locked INTEGER NOT NULL DEFAULT 0` 后老示例全部未锁、数据不动，只执行一次），并把强制作在 `Store` 层：`Store::update` / `Store::delete` 对 `locked = true` 的行返回错误「示例已锁定，无法修改 / 删除」，`Store::set_locked` 直接改列而不经过 `update`，以免被自身校验挡住。界面层据此在侧栏行右端画锁图标（已锁常显 🔒、未锁悬停显 🔓、草稿不显示），图标独占命中区——命中时不选中、不进内联编辑、不起拖动——点击即刻切换并写库、无二次确认；锁定后标题 / 图片 / 五分区 / 删除全部禁用、中央区五分区置灰且不可交互（代价：框内文字无法划词，复制走底栏「复制提示词」），但**拖动排序仍允许**（只读不等于不能整理），也允许选中查看、复制提示词、另存为（副本是新草稿）。归档格式给 `ArchiveExample` 加 `#[serde(default)] locked: bool` 并保持 `archive_version = 1`：纯附加可选字段，新版读旧包得全未锁、旧版读新包忽略该字段，双向不崩。

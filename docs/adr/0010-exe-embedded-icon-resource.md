@@ -1,0 +1,7 @@
+# exe 内嵌图标资源：任务栏与资源管理器只认可执行文件里的 .ico
+
+v0.1.4 的自绘标题栏让应用图标成了品牌元素（ADR-0009），代码里用程序化像素（`src\icon_render.rs`）渲染，窗口级只做了 `ViewportBuilder::with_icon(app_icon())`。实机核对发现：`WM_GETICON` 的大 / 小图标句柄都非 0、导出的位图确实是我们的图标，**但 Win11 任务栏按钮显示的仍是系统默认图标**——未打包应用的 taskbar / 资源管理器取的是 exe 的 `.rsrc` 图标资源，窗口级 `WM_SETICON` 只影响窗口自身（Alt+Tab 预览、窗口角标），补不了这一层。因此把图标在链接期编进 exe：新增 `build.rs`，它 `#[path = "src/icon_render.rs"]` 复用同一份像素与新增的 `ico(sizes)`（32bpp BMP 条目、自底向上 BGRA、AND 掩码全零，256 记 width/height = 0），构建时在 `OUT_DIR` 生成 `.ico`（16/24/32/48/64/128/256）与一份 `.rc`（一条 `1 ICON` 资源 + VERSIONINFO，`FILEVERSION` 由 `CARGO_PKG_VERSION` 拼出、StringFileInfo 只用 ASCII 以免代码页问题），再调 Windows SDK 的 `rc.exe` 编成 `.res`，用 `cargo:rustc-link-arg-bins` 交给链接器。
+
+代价与边界（明确接受）：构建**多一个可选前置条件**——需要 Windows SDK 的 `rc.exe`（构建脚本按 `RC` 环境变量 → `%ProgramFiles(x86)%\Windows Kits\10\bin\*\x64\rc.exe` 最高版本 的顺序找）。找不到时只发 `cargo:warning`、不失败：exe 仍能构建，只是没有图标资源与版本信息，任务栏退回系统默认图标。为免「同一份设计稿存在两处」，图标**不**以图片文件入库：像素只在 `src\icon_render.rs`，`.ico` 与 `.rc` 都是 `OUT_DIR` 里的构建中间产物，改设计稿只需改那一个文件。窗口级 `with_icon` 保留——它决定窗口自身的图标（Alt+Tab 列表缩略图旁的小图标、以及未取 exe 资源的宿主）；`src/bin/iconasset.rs` 是配套开发工具，用同一份像素刷新 `docs\images\icon.png`（256×256）与 `docs\images\icon.ico`（多尺寸），那是文档配图，不参与构建。
+
+备选方案：把 `.ico` 作为二进制资源入库、构建脚本只负责嵌入（多一份会漂移的真源，直接否）；用 `winres` / `embed-resource` 等 crate 代替手写构建脚本（项目硬规则不新增依赖，且它们同样依赖 `rc.exe`）；只在运行时调 Win32 `SetIcon`（实测无效，任务栏不看窗口级图标）。**已知残留**：Windows 会按 exe 路径缓存图标，改动图标后同一路径的旧缓存可能让资源管理器短暂显示旧图，重启资源管理器或重建到新路径后恢复。
