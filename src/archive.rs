@@ -78,11 +78,19 @@ pub fn default_file_name(at: i64) -> String {
     format!("{ARCHIVE_PREFIX}-{}.zip", compact_timestamp(at))
 }
 
-/// 把图库导出到 `target`。
+/// 把整个图库导出到 `target`。
 ///
 /// 先写 `<target>.part` 再改名，避免半截文件被误当成有效备份。
 pub fn export(store: &Store, target: &Path) -> Result<usize> {
     let ids: Vec<i64> = store.rows().iter().map(|row| row.id).collect();
+    export_ids(store, &ids, target)
+}
+
+/// 只导出选中的示例（按 `ids` 的顺序写入 data.json）。
+pub fn export_ids(store: &Store, ids: &[i64], target: &Path) -> Result<usize> {
+    if ids.is_empty() {
+        return Err(anyhow!("没有选择任何示例"));
+    }
 
     let mut data = ArchiveData {
         archive_version: ARCHIVE_VERSION,
@@ -93,7 +101,7 @@ pub fn export(store: &Store, target: &Path) -> Result<usize> {
     // 哈希 -> 磁盘上的文件名，用于把同一张图只写一次进 zip。
     let mut packed_images: BTreeMap<String, String> = BTreeMap::new();
 
-    for id in ids {
+    for id in ids.iter().copied() {
         let example = match store.load(id)? {
             Some(example) => example,
             None => continue,

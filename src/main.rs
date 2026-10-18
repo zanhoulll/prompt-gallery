@@ -14,13 +14,14 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use eframe::egui;
 use egui::{
-    Align, Color32, CornerRadius, Frame, Id, Key, Layout, Modifiers, Rect, RichText, ScrollArea,
-    Sense, Stroke, StrokeKind, TextEdit, Vec2,
+    Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Id, Key, Layout,
+    Modifiers, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, Vec2,
 };
 
 use prompt_gallery::archive;
@@ -30,18 +31,22 @@ use prompt_gallery::model::{
 };
 use prompt_gallery::store::{self, Store};
 
+mod icon;
 mod testhook;
+mod theme;
 
 /// 窗口标题；同时是应用显示名（CONTEXT.md）。
 const APP_TITLE: &str = "Prompt Gallery";
 /// 侧边栏默认宽度。
 const SIDEBAR_WIDTH: f32 = 248.0;
-/// 分区标题的灰色（用 `Label::selectable(false)` 保证不可选中）。
-const HEADER_GRAY: Color32 = Color32::from_gray(150);
-/// 分区之间的细分隔线。
-const SEAM_COLOR: Color32 = Color32::from_gray(72);
-/// 图片框背景。
-const IMAGE_BOX_FILL: Color32 = Color32::from_rgb(28, 30, 34);
+/// 自绘标题栏高度（ADR-0009）。
+const TITLE_BAR_HEIGHT: f32 = 40.0;
+/// 标题栏右侧窗口按钮宽度。
+const WINDOW_BUTTON_WIDTH: f32 = 46.0;
+/// 窗口八向缩放热区厚度。
+const RESIZE_EDGE: f32 = 5.0;
+/// 窗口四角缩放热区边长。
+const RESIZE_CORNER: f32 = 12.0;
 /// 「长按拖动」达标时间：从指针**物理按下**时刻计时（§1，ADR-0005）。
 const REORDER_HOLD: Duration = Duration::from_millis(280);
 /// 已落库示例的自动保存防抖窗口（ADR-0006）。
@@ -75,6 +80,9 @@ fn main() -> eframe::Result<()> {
             .with_app_id("prompt-gallery")
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([880.0, 560.0])
+            // ADR-0009：不要系统标题栏，自己画；透明让圆角外露背景。
+            .with_decorations(false)
+            .with_transparent(true)
             .with_icon(app_icon()),
         // wgpu 在 Windows 上比 OpenGL 更稳（无需系统 GL 驱动）。
         renderer: eframe::Renderer::Wgpu,
@@ -89,7 +97,13 @@ fn main() -> eframe::Result<()> {
             // 中文界面必须挂上系统 CJK 字体，否则全是豆腐块。
             install_cjk_fonts(&cc.egui_ctx);
             match Store::open() {
-                Ok(store) => Ok(Box::new(GalleryView::new(store))),
+                Ok(store) => {
+                    // 外观设置与数据库同目录：先读配置，再决定首帧皮肤。
+                    let config = theme::load_config(store.data_dir());
+                    cc.egui_ctx.set_theme(config.theme.preference());
+                    theme::apply(&cc.egui_ctx);
+                    Ok(Box::new(GalleryView::new(store, config.theme)))
+                }
                 Err(err) => Ok(Box::new(FatalView {
                     message: format!("{err:#}"),
                 })),
@@ -105,8 +119,15 @@ struct FatalView {
 
 impl eframe::App for FatalView {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        theme::apply(ui.ctx());
+        let p = theme::Palette::current(ui.ctx());
         egui::Frame::central_panel(ui.style()).show(ui, |ui| {
-            ui.heading(format!("{APP_TITLE} 无法启动"));
+            ui.label(
+                RichText::new(format!("{APP_TITLE} 无法启动"))
+                    .size(20.0)
+                    .strong()
+                    .color(p.text_strong),
+            );
             ui.add_space(8.0);
             ui.label("数据库无法打开，请检查数据目录的读写权限后重试：");
             ui.add_space(4.0);
@@ -129,6 +150,10 @@ struct GalleryView {
     baseline: Option<Example>,
     /// 数据库文件所在目录（缓存成 String，便于 UI 显示与导出）。
     data_dir: String,
+    /// 外观设置（跟随系统 / 浅色 / 深色），持久化在 config.json。
+    theme_choice: theme::ThemeChoice,
+    /// 上一帧实际生效的皮肤；与 ctx.theme() 不同就重挂 Style。
+    applied_theme: Option<egui::Theme>,
     cache: ImageCache,
     /// 待入库图片（Pending Image）：只记源路径，保存时才按内容哈希写入托管目录（ADR-0004）。
     pending_image: Option<PendingImage>,
@@ -145,6 +170,8 @@ struct GalleryView {
     /// 导出弹窗与路径缓冲区。
     export_open: bool,
     export_path: String,
+    /// 导出弹窗里被勾选的示例 id（默认全选，§4）。
+    export_selected: BTreeSet<i64>,
     /// 侧边栏长按拖动的手势状态（§1，替代旧的
     /// `drag_row_id` / `drag_moved` / `drag_started` / `drag_target`）。
     row_drag: Option<RowDrag>,
@@ -159,13 +186,15 @@ struct GalleryView {
 }
 
 impl GalleryView {
-    fn new(store: Store) -> Self {
+    fn new(store: Store, theme_choice: theme::ThemeChoice) -> Self {
         let data_dir = store.data_dir().to_string_lossy().to_string();
         let mut view = Self {
             store,
             current: None,
             baseline: None,
             data_dir,
+            theme_choice,
+            applied_theme: None,
             cache: ImageCache::new(),
             pending_image: None,
             status: String::new(),
@@ -176,6 +205,7 @@ impl GalleryView {
             pending_select: None,
             export_open: false,
             export_path: String::new(),
+            export_selected: BTreeSet::new(),
             row_drag: None,
             autosave_deadline: None,
             close_confirm: false,
@@ -493,7 +523,15 @@ impl GalleryView {
         if target.extension().is_none() {
             target.set_extension("zip");
         }
-        match archive::export(&self.store, &target) {
+        // 只导出勾选的示例，顺序与侧边栏一致（D7）。
+        let ids: Vec<i64> = self
+            .store
+            .rows()
+            .iter()
+            .map(|row| row.id)
+            .filter(|id| self.export_selected.contains(id))
+            .collect();
+        match archive::export_ids(&self.store, &ids, &target) {
             Ok(count) => {
                 self.export_open = false;
                 self.set_status(ctx, format!("已导出 {count} 条 → {}", target.display()));
@@ -545,8 +583,20 @@ impl eframe::App for GalleryView {
         }
     }
 
+    /// 透明窗口：圆角之外必须是真透明，否则会露出黑色方角（ADR-0009）。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // 系统深浅色可能在运行中变化：只在真的变了时重挂一次 Style。
+        let current_theme = ctx.theme();
+        if self.applied_theme != Some(current_theme) {
+            self.applied_theme = Some(current_theme);
+            theme::apply(&ctx);
+        }
 
         // 拖进窗口的图片文件（与侧边栏重排不冲突：那是内部拖拽，这里是外部文件）。
         // ADR-0004：只记住源路径，保存时才按内容哈希入库。
@@ -578,11 +628,18 @@ impl eframe::App for GalleryView {
         }
 
         self.handle_shortcuts(&ctx);
-        self.sidebar(ui);
-        self.bottom_bar(ui);
-        self.central(ui);
+
+        // 自绘窗口：圆角画布 + 顶部标题栏，其余面板照旧（ADR-0009）。
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        theme::window_frame(&ctx, maximized).show(ui, |ui| {
+            self.title_bar(ui);
+            self.sidebar(ui);
+            self.bottom_bar(ui);
+            self.central(ui);
+        });
         self.dialogs(&ctx);
         self.tick_status(&ctx);
+        self.resize_grips(&ctx, maximized);
 
         // 拖动中每帧重绘：虚影跟手、热区自动滚动、落点实时重算（§1、§2、§3）。
         if self.editing_title.is_some()
@@ -598,7 +655,247 @@ impl eframe::App for GalleryView {
 }
 
 impl GalleryView {
-    /// 状态时间戳的延迟刷新：`set_status` 拿不到 ctx 时先写 NaN，这里补上。
+    // ------------------------------------------------------------ 标题栏（ADR-0009）
+
+    fn title_bar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let p = theme::Palette::current(&ctx);
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+
+        egui::Panel::top("title_bar")
+            .exact_size(TITLE_BAR_HEIGHT)
+            .frame(egui::Frame::new())
+            .show(ui, |ui| {
+                let rect = ui.max_rect();
+                let radius = if maximized {
+                    CornerRadius::ZERO
+                } else {
+                    // 比窗口外框（10）小 1pt：正好落在 1pt 描边内侧。
+                    CornerRadius { nw: 9, ne: 9, sw: 0, se: 0 }
+                };
+                ui.painter().rect_filled(rect, radius, p.surface_raised);
+
+                // 拖动热区先登记：后画的按钮与菜单在上层，点击不会被拖动吃掉。
+                let drag = ui.interact(rect, Id::new("title_bar_drag"), Sense::click_and_drag());
+                let mut on_child = false;
+
+                // 左右两组都嵌在这一个闭包内：平级各开一个 scope 时，第二组会被换行挤到下一行并裁掉。
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.add_space(12.0);
+                        let (icon_rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                        icon::paint(ui.painter(), icon_rect);
+                        ui.add_space(2.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(APP_TITLE).size(14.0).color(p.text_strong),
+                            )
+                            .selectable(false),
+                        );
+                        ui.add_space(8.0);
+
+                        // 「数据管理」是导出 / 导入 / 打开数据目录的唯一入口（D5）。
+                        let data = chrome_button(ui, "数据管理", &p);
+                        on_child |= data.hovered();
+                        egui::Popup::menu(&data).show(|ui| {
+                            ui.set_min_width(180.0);
+                            let mut action = None;
+                            if menu_item(ui, "导出图库", false, &p).clicked() {
+                                action = Some(Action::Export);
+                            }
+                            if menu_item(ui, "导入图库", false, &p).clicked() {
+                                action = Some(Action::Import);
+                            }
+                            if menu_item(ui, "打开数据目录", false, &p).clicked() {
+                                action = Some(Action::OpenDataDir);
+                            }
+                            if let Some(action) = action {
+                                self.run_action(&ctx, action);
+                            }
+                        });
+
+                        let about = chrome_button(ui, "关于", &p);
+                        on_child |= about.hovered();
+                        if about.clicked() {
+                            self.about_open = true;
+                        }
+
+                        let appearance = chrome_button(ui, "外观", &p);
+                        on_child |= appearance.hovered();
+                        egui::Popup::menu(&appearance).show(|ui| {
+                            ui.set_min_width(180.0);
+                            let mut chosen = None;
+                            for (choice, label) in [
+                                (theme::ThemeChoice::System, "跟随系统"),
+                                (theme::ThemeChoice::Light, "浅色"),
+                                (theme::ThemeChoice::Dark, "深色"),
+                            ] {
+                                let selected = self.theme_choice == choice;
+                                if menu_item(ui, label, selected, &p).clicked() {
+                                    chosen = Some(choice);
+                                }
+                            }
+                            if let Some(choice) = chosen {
+                                self.set_theme_choice(&ctx, choice);
+                            }
+                        });
+                        // 右侧窗口按钮：同一行内从右往左排，贴边零间距。
+                        ui.scope(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let close = window_button(ui, WindowButton::Close, &p);
+                                on_child |= close.hovered();
+                                if close.clicked() {
+                                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                                let maximize = window_button(ui, WindowButton::Maximize, &p);
+                                on_child |= maximize.hovered();
+                                if maximize.clicked() {
+                                    ui.ctx()
+                                        .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                                }
+                                let minimize = window_button(ui, WindowButton::Minimize, &p);
+                                on_child |= minimize.hovered();
+                                if minimize.clicked() {
+                                    ui.ctx()
+                                        .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                                }
+                            });
+                        });
+                    });
+                });
+                // 拖动整条标题栏；双击最大化 / 还原。
+                if drag.drag_started_by(egui::PointerButton::Primary) && !on_child {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if drag.double_clicked() && !on_child {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
+            });
+    }
+
+    /// 兼容顶栏与底栏的同一个动作分发点。
+    fn run_action(&mut self, ctx: &egui::Context, action: Action) {
+        match action {
+            Action::Save => self.save_current(),
+            Action::SaveAs => self.save_as(),
+            Action::Delete => self.delete_confirm = true,
+            Action::Export => {
+                self.export_path = Path::new(&self.data_dir)
+                    .join(archive::default_file_name(now_unix()))
+                    .to_string_lossy()
+                    .to_string();
+                // 每次打开都默认全选（D7）。
+                self.export_selected = self.store.rows().iter().map(|row| row.id).collect();
+                self.export_open = true;
+            }
+            Action::Import => self.import_dialog(ctx),
+            Action::OpenDataDir => open_in_explorer(Path::new(&self.data_dir)),
+        }
+    }
+
+    fn set_theme_choice(&mut self, ctx: &egui::Context, choice: theme::ThemeChoice) {
+        self.theme_choice = choice;
+        ctx.set_theme(choice.preference());
+        theme::apply(ctx);
+        self.applied_theme = Some(ctx.theme());
+        let config = theme::AppConfig { theme: choice };
+        if theme::save_config(Path::new(&self.data_dir), &config).is_err() {
+            self.set_status(ctx, "主题设置未能保存".to_string());
+        }
+    }
+
+    /// 八向缩放手势热区：系统标题栏没了，缩放要自己接（ADR-0009）。
+    fn resize_grips(&self, ctx: &egui::Context, maximized: bool) {
+        if maximized {
+            return;
+        }
+        // 用局部坐标（原点在客户区左上）；viewport().inner_rect 是屏幕坐标，
+        // 直接拿来会把热区整体平移出窗口。
+        let screen = ctx.content_rect();
+        let (left, top) = (screen.min.x, screen.min.y);
+        let (right, bottom) = (screen.max.x, screen.max.y);
+        let e = RESIZE_EDGE;
+        let c = RESIZE_CORNER;
+        let grips = [
+            (
+                "north",
+                Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, top + e)),
+                egui::ResizeDirection::North,
+                CursorIcon::ResizeNorth,
+            ),
+            (
+                "south",
+                Rect::from_min_max(egui::pos2(left, bottom - e), egui::pos2(right, bottom)),
+                egui::ResizeDirection::South,
+                CursorIcon::ResizeSouth,
+            ),
+            (
+                "west",
+                Rect::from_min_max(egui::pos2(left, top), egui::pos2(left + e, bottom)),
+                egui::ResizeDirection::West,
+                CursorIcon::ResizeWest,
+            ),
+            (
+                "east",
+                Rect::from_min_max(egui::pos2(right - e, top), egui::pos2(right, bottom)),
+                egui::ResizeDirection::East,
+                CursorIcon::ResizeEast,
+            ),
+            (
+                "nw",
+                Rect::from_min_max(egui::pos2(left, top), egui::pos2(left + c, top + c)),
+                egui::ResizeDirection::NorthWest,
+                CursorIcon::ResizeNorthWest,
+            ),
+            (
+                "ne",
+                Rect::from_min_max(
+                    egui::pos2(right - c, top),
+                    egui::pos2(right, top + c),
+                ),
+                egui::ResizeDirection::NorthEast,
+                CursorIcon::ResizeNorthEast,
+            ),
+            (
+                "sw",
+                Rect::from_min_max(
+                    egui::pos2(left, bottom - c),
+                    egui::pos2(left + c, bottom),
+                ),
+                egui::ResizeDirection::SouthWest,
+                CursorIcon::ResizeSouthWest,
+            ),
+            (
+                "se",
+                Rect::from_min_max(
+                    egui::pos2(right - c, bottom - c),
+                    egui::pos2(right, bottom),
+                ),
+                egui::ResizeDirection::SouthEast,
+                CursorIcon::ResizeSouthEast,
+            ),
+        ];
+        for (name, rect, direction, cursor) in grips {
+            egui::Area::new(Id::new(("resize_grip", name)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(rect.min)
+                .movable(false)
+                .interactable(true)
+                .show(ctx, |ui| {
+                    let (_, response) = ui.allocate_exact_size(rect.size(), Sense::drag());
+                    let response = response.on_hover_cursor(cursor);
+                    if response.drag_started() {
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+                    }
+                });
+        }
+    }
+
+    /// 状态时间戳的延迟刷新：set_status 拿不到 ctx 时先写 NaN，这里补上。
     fn tick_status(&mut self, ctx: &egui::Context) {
         if self.status_time.is_nan() {
             self.status_time = ctx.input(|i| i.time);
@@ -673,7 +970,7 @@ impl GalleryView {
                 ui.painter().hline(
                     seam_rect.x_range(),
                     seam_rect.center().y,
-                    Stroke::new(1.0, SEAM_COLOR),
+                    Stroke::new(1.0, theme::Palette::current(ui.ctx()).border),
                 );
                 ui.add_space(2.0);
 
@@ -1002,7 +1299,7 @@ impl GalleryView {
                                                 y,
                                                 Stroke::new(
                                                     2.0,
-                                                    Color32::from_rgb(120, 170, 255),
+                                                    theme::Palette::current(ui.ctx()).accent,
                                                 ),
                                             );
                                         }
@@ -1253,156 +1550,126 @@ impl GalleryView {
     }
 
     fn bottom_bar(&mut self, ui: &mut egui::Ui) {
-        let resp = egui::Panel::bottom("bottom_bar")
-            .show(ui, |ui| {
-                ui.add_space(4.0);
-                let mut actions: Vec<Action> = Vec::new();
-                let mut open_about = false;
-                ui.horizontal(|ui| {
-                    let draft = self
-                        .current
-                        .as_ref()
-                        .map(|example| example.is_draft())
-                        .unwrap_or(true);
-                    let dirty = self.dirty();
-                    let locked = self
-                        .current
-                        .as_ref()
-                        .map(|example| example.locked)
-                        .unwrap_or(false);
-                    if draft {
-                        if ui
-                            .add_enabled(self.current.is_some(), egui::Button::new("保存为新示例"))
-                            .on_hover_text("草稿落库：此时才把图片复制入库")
-                            .clicked()
-                        {
-                            actions.push(Action::Save);
-                        }
-                    } else if ui
-                        .add_enabled(dirty && !locked, egui::Button::new("保存"))
-                        .on_hover_text(if locked {
-                            "该示例已锁定，无法修改"
-                        } else {
-                            "Ctrl+S"
-                        })
+        let ctx = ui.ctx().clone();
+        let p = theme::Palette::current(&ctx);
+        let mut actions: Vec<Action> = Vec::new();
+        egui::Panel::bottom("bottom_bar").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let draft = self
+                    .current
+                    .as_ref()
+                    .map(|example| example.is_draft())
+                    .unwrap_or(true);
+                let dirty = self.dirty();
+                let locked = self
+                    .current
+                    .as_ref()
+                    .map(|example| example.locked)
+                    .unwrap_or(false);
+                if draft {
+                    if ui
+                        .add_enabled(self.current.is_some(), egui::Button::new("保存为新示例"))
+                        .on_hover_text("草稿落库：此时才把图片复制入库")
                         .clicked()
                     {
                         actions.push(Action::Save);
                     }
-                    if ui
-                        .add_enabled(self.current.is_some(), egui::Button::new("另存为"))
-                        .on_hover_text("复制成一条新示例，原示例保持不变（Ctrl+Shift+S）")
-                        .clicked()
-                    {
-                        actions.push(Action::SaveAs);
-                    }
-                    if ui
-                        .add_enabled(self.current_id().is_some() && !locked, egui::Button::new("删除"))
-                        .on_hover_text(if locked {
-                            "该示例已锁定，无法删除"
-                        } else {
-                            "删除当前示例（托管图片文件保留）"
-                        })
-                        .clicked()
-                    {
-                        actions.push(Action::Delete);
-                    }
+                } else if ui
+                    .add_enabled(dirty && !locked, egui::Button::new("保存"))
+                    .on_hover_text(if locked {
+                        "该示例已锁定，无法修改"
+                    } else {
+                        "Ctrl+S"
+                    })
+                    .clicked()
+                {
+                    actions.push(Action::Save);
+                }
+                if ui
+                    .add_enabled(self.current.is_some(), egui::Button::new("另存为"))
+                    .on_hover_text("复制成一条新示例，原示例保持不变（Ctrl+Shift+S）")
+                    .clicked()
+                {
+                    actions.push(Action::SaveAs);
+                }
+                if ui
+                    .add_enabled(
+                        self.current_id().is_some() && !locked,
+                        egui::Button::new("删除"),
+                    )
+                    .on_hover_text(if locked {
+                        "该示例已锁定，无法删除"
+                    } else {
+                        "删除当前示例（托管图片文件保留）"
+                    })
+                    .clicked()
+                {
+                    actions.push(Action::Delete);
+                }
 
-                    ui.separator();
-                    // §4：复制提示词沿用禁用逻辑——五个分区正文全空时置灰。
-                    let clipboard_text = self
+                ui.separator();
+                // 复制提示词沿用禁用逻辑——五个分区正文全空时置灰。
+                let clipboard_text = self
+                    .current
+                    .as_ref()
+                    .map(|example| example.sections.join_for_clipboard())
+                    .unwrap_or_default();
+                let can_copy = !clipboard_text.is_empty();
+                if ui
+                    .add_enabled(can_copy, egui::Button::new("复制提示词"))
+                    .on_hover_text("只复制五个分区的正文，不含分区标题")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(clipboard_text);
+                    self.set_status(ui.ctx(), "正向提示词已复制到剪贴板".to_string());
+                }
+
+                ui.separator();
+                let status_text = self.status_message(ui.ctx());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // 最右：纯文本版本号，不可点、不参与任何动作（D9）。
+                    let version = env!("CARGO_PKG_VERSION");
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("v{version}"))
+                                .color(p.text_muted)
+                                .size(12.0),
+                        )
+                        .selectable(false),
+                    );
+                    // 版本号左边：仅「非空草稿」时提示尚未落库。
+                    let draft_unsaved = self
                         .current
                         .as_ref()
-                        .map(|example| example.sections.join_for_clipboard())
-                        .unwrap_or_default();
-                    let can_copy = !clipboard_text.is_empty();
-                    if ui
-                        .add_enabled(can_copy, egui::Button::new("复制提示词"))
-                        .on_hover_text("只复制五个分区的正文，不含分区标题")
-                        .clicked()
-                    {
-                        ui.ctx().copy_text(clipboard_text);
-                        self.set_status(ui.ctx(), "正向提示词已复制到剪贴板".to_string());
-                    }
-                    if ui.button("导出图库…").clicked() {
-                        actions.push(Action::Export);
-                    }
-                    if ui.button("导入图库…").clicked() {
-                        actions.push(Action::Import);
-                    }
-                    if ui.button("打开数据目录").clicked() {
-                        actions.push(Action::OpenDataDir);
-                    }
-
-                    ui.separator();
-                    let status_text = self.status_message(ui.ctx());
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        // 最右：版本按钮，点开「关于」（§5）。
-                        let version = env!("CARGO_PKG_VERSION");
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(format!("v{version}"))
-                                        .color(HEADER_GRAY)
-                                        .size(12.0),
-                                )
-                                .frame(false),
-                            )
-                            .on_hover_text("关于 Prompt Gallery")
-                            .clicked()
-                        {
-                            open_about = true;
-                        }
-                        // 版本号左边：仅「非空草稿」时提示尚未落库（§5）。
-                        let draft_unsaved = self
-                            .current
-                            .as_ref()
-                            .map(|example| example.is_draft() && !example.is_blank())
-                            .unwrap_or(false);
-                        if draft_unsaved {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new("草稿未保存").color(HEADER_GRAY).size(12.0),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text("草稿只在保存为新示例后才落库");
-                        }
-                        // 状态文案占据剩余宽度，窄窗口下自适应截断（§4）。
-                        let width = ui.available_width().max(0.0);
-                        let height = ui.text_style_height(&egui::TextStyle::Body).max(16.0);
-                        ui.add_sized(
-                            [width, height],
+                        .map(|example| example.is_draft() && !example.is_blank())
+                        .unwrap_or(false);
+                    if draft_unsaved {
+                        ui.add(
                             egui::Label::new(
-                                RichText::new(status_text).color(HEADER_GRAY).size(12.0),
+                                RichText::new("草稿未保存").color(p.text_muted).size(12.0),
                             )
                             .truncate(),
-                        );
-                    });
+                        )
+                        .on_hover_text("草稿只在保存为新示例后才落库");
+                    }
+                    // 状态文案占据剩余宽度，窄窗口下自适应截断。
+                    let width = ui.available_width().max(0.0);
+                    let height = ui.text_style_height(&egui::TextStyle::Body).max(16.0);
+                    ui.add_sized(
+                        [width, height],
+                        egui::Label::new(
+                            RichText::new(status_text).color(p.text_muted).size(12.0),
+                        )
+                        .truncate(),
+                    );
                 });
-                ui.add_space(4.0);
-                if open_about {
-                    self.about_open = true;
-                }
-                actions
             });
-        let actions = resp.inner;
+            ui.add_space(4.0);
+        });
 
         for action in actions {
-            match action {
-                Action::Save => self.save_current(),
-                Action::SaveAs => self.save_as(),
-                Action::Delete => self.delete_confirm = true,
-                Action::Export => {
-                    self.export_path = Path::new(&self.data_dir)
-                        .join(archive::default_file_name(now_unix()))
-                        .to_string_lossy()
-                        .to_string();
-                    self.export_open = true;
-                }
-                Action::Import => self.import_dialog(ui.ctx()),
-                Action::OpenDataDir => open_in_explorer(Path::new(&self.data_dir)),
-            }
+            self.run_action(&ctx, action);
         }
     }
 
@@ -1433,6 +1700,7 @@ impl GalleryView {
     }
 
     fn image_box(&mut self, ui: &mut egui::Ui, height: f32) {
+        let p = theme::Palette::current(ui.ctx());
         let width = ui.available_width();
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
         // 锁定示例：图片框不响应点击、不接受拖入（ADR-0007）。
@@ -1450,16 +1718,16 @@ impl GalleryView {
         let file_drop_hover =
             ui.ctx().input(|i| !i.raw.hovered_files.is_empty()) && pointer_over && !locked;
         let stroke_color = if file_drop_hover {
-            Color32::from_rgb(120, 170, 255)
+            p.accent
         } else if hovered {
-            Color32::from_gray(120)
+            p.border_strong
         } else {
-            Color32::from_gray(72)
+            p.border
         };
         ui.painter().rect(
             rect,
             CornerRadius::same(6),
-            IMAGE_BOX_FILL,
+            p.surface_sunken,
             Stroke::new(
                 if hovered || file_drop_hover { 2.0 } else { 1.0 },
                 stroke_color,
@@ -1482,14 +1750,14 @@ impl GalleryView {
             ui.painter().rect_filled(
                 remove_rect,
                 CornerRadius::same(4),
-                Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+                p.row_hover,
             );
             ui.painter().text(
                 remove_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "×",
                 egui::FontId::proportional(14.0),
-                Color32::from_gray(210),
+                p.text,
             );
         }
 
@@ -1544,7 +1812,7 @@ impl GalleryView {
                             egui::Align2::CENTER_CENTER,
                             format!("图片无法显示{}", err),
                             egui::FontId::proportional(13.0),
-                            Color32::from_gray(200),
+                            p.text,
                         );
                     }
                 }
@@ -1572,7 +1840,7 @@ impl GalleryView {
                             egui::Align2::CENTER_CENTER,
                             format!("图片无法显示{}", err),
                             egui::FontId::proportional(13.0),
-                            Color32::from_gray(200),
+                            p.text,
                         );
                     }
                 }
@@ -1587,7 +1855,7 @@ impl GalleryView {
                         "点击或拖拽本地图片到此处"
                     },
                     egui::FontId::proportional(14.0),
-                    Color32::from_gray(150),
+                    p.text_faint,
                 );
             }
         }
@@ -1597,14 +1865,14 @@ impl GalleryView {
             ui.painter().rect_filled(
                 rect,
                 CornerRadius::same(6),
-                Color32::from_rgba_unmultiplied(0, 0, 0, 90),
+                p.backdrop,
             );
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "点击更换图片",
                 egui::FontId::proportional(14.0),
-                Color32::from_gray(235),
+                Color32::WHITE,
             );
         }
 
@@ -1618,8 +1886,9 @@ impl GalleryView {
     /// 分区标题是独立的灰字 `Label`（`selectable(false)`），不是文本框内容的一部分，
     /// 因此天然不可编辑、不可选中，也不会随复制进入剪贴板。
     fn prompt_editor(&mut self, ui: &mut egui::Ui) {
+        let p = theme::Palette::current(ui.ctx());
         let Some(example) = self.current.as_mut() else {
-            ui.label(RichText::new("没有选中的示例").color(HEADER_GRAY));
+            ui.label(RichText::new("没有选中的示例").color(p.text_muted));
             return;
         };
         let locked = example.locked;
@@ -1628,8 +1897,8 @@ impl GalleryView {
         let mut changed = false;
 
         Frame::new()
-            .fill(Color32::from_gray(20))
-            .stroke(Stroke::new(1.0, Color32::from_gray(70)))
+            .fill(p.surface_sunken)
+            .stroke(Stroke::new(1.0, p.border))
             .corner_radius(CornerRadius::same(6))
             .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
@@ -1667,50 +1936,56 @@ impl GalleryView {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        let p = theme::Palette::current(ctx);
+        // Esc 与「取消」同义：只关闭当前弹窗，不做任何改动。
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
         // 未保存改动确认。
         if self.pending_select.is_some() {
-            egui::Modal::new(Id::new("unsaved_modal")).show(ctx, |ui| {
-                ui.set_width(320.0);
-                ui.heading("草稿尚未保存");
-                ui.add_space(6.0);
-                ui.label("当前草稿还没有保存为示例，要如何处理？");
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button("保存为示例").clicked() {
-                        self.save_current();
-                        self.perform_pending_select();
+            let mut save = false;
+            let mut discard = false;
+            let mut cancel = false;
+            theme::modal_shell(ctx, "unsaved_modal", 320.0, |ui| {
+                theme::modal_title(ui, "草稿尚未保存");
+                theme::modal_desc(ui, "当前草稿还没有保存为示例，要如何处理？");
+                ui.add_space(18.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::primary_button(ui, "保存为示例").clicked() {
+                        save = true;
                     }
-                    if ui.button("放弃草稿").clicked() {
-                        self.perform_pending_select();
+                    if theme::secondary_button(ui, "放弃草稿").clicked() {
+                        discard = true;
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("取消").clicked() {
-                            self.pending_select = None;
-                        }
-                    });
+                    if theme::secondary_button(ui, "取消").clicked() {
+                        cancel = true;
+                    }
                 });
             });
+            if save {
+                self.save_current();
+                self.perform_pending_select();
+            } else if discard {
+                self.perform_pending_select();
+            } else if cancel || escape {
+                self.pending_select = None;
+            }
         }
 
         // 关窗确认：只有非空草稿会走到这里（ADR-0006 D9）。
         if self.close_confirm {
             let mut discard = false;
             let mut cancel = false;
-            egui::Modal::new(Id::new("close_modal")).show(ctx, |ui| {
-                ui.set_width(320.0);
-                ui.heading("草稿尚未保存");
-                ui.add_space(6.0);
-                ui.label("当前草稿还没有保存为新示例，关窗后改动会丢失。");
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button("放弃草稿").clicked() {
+            theme::modal_shell(ctx, "close_modal", 320.0, |ui| {
+                theme::modal_title(ui, "草稿尚未保存");
+                theme::modal_desc(ui, "当前草稿还没有保存为新示例，关窗后改动会丢失。");
+                ui.add_space(18.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::secondary_button(ui, "放弃草稿").clicked() {
                         discard = true;
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("取消").clicked() {
-                            cancel = true;
-                        }
-                    });
+                    if theme::secondary_button(ui, "取消").clicked() {
+                        cancel = true;
+                    }
                 });
             });
             if discard {
@@ -1720,72 +1995,65 @@ impl GalleryView {
                 self.current = None;
                 self.pending_image = None;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            } else if cancel {
+            } else if cancel || escape {
                 self.close_confirm = false;
             }
         }
 
-        // 关于（§5：底栏最右的版本按钮打开）。
+        // 关于（D4）：只有名称与版本号。
         if self.about_open {
             let mut close = false;
-            egui::Modal::new(Id::new("about_modal")).show(ctx, |ui| {
-                ui.set_width(380.0);
-                ui.heading(format!("{APP_TITLE} v{}", env!("CARGO_PKG_VERSION")));
-                ui.add_space(8.0);
-                ui.label(RichText::new("数据目录").color(HEADER_GRAY).size(12.0));
-                ui.monospace(self.data_dir.clone());
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(format!("归档格式版本 {}", archive::ARCHIVE_VERSION))
-                        .color(HEADER_GRAY)
-                        .size(12.0),
+            let version = env!("CARGO_PKG_VERSION");
+            theme::modal_shell(ctx, "about_modal", 340.0, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(APP_TITLE)
+                            .size(18.0)
+                            .strong()
+                            .color(p.text_strong),
+                    )
+                    .selectable(false),
                 );
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if ui.button("复制路径").clicked() {
-                        ui.ctx().copy_text(self.data_dir.clone());
-                        self.set_status(ui.ctx(), "数据目录路径已复制".to_string());
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("v{version}"))
+                            .size(13.0)
+                            .color(p.text_muted),
+                    )
+                    .selectable(false),
+                );
+                ui.add_space(18.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::secondary_button(ui, "关闭").clicked() {
+                        close = true;
                     }
-                    if ui.button("打开数据目录").clicked() {
-                        open_in_explorer(Path::new(&self.data_dir));
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("关闭").clicked() {
-                            close = true;
-                        }
-                    });
                 });
             });
-            if close {
+            if close || escape {
                 self.about_open = false;
             }
         }
 
         // 删除确认。
         if self.delete_confirm {
-            let mut close = false;
             let mut confirm = false;
-            egui::Modal::new(Id::new("delete_modal")).show(ctx, |ui| {
-                ui.set_width(340.0);
-                ui.heading("删除这条示例？");
-                ui.add_space(6.0);
-                let name = self
-                    .current
-                    .as_ref()
-                    .map(|example| example.display_title().to_string())
-                    .unwrap_or_default();
-                ui.label(format!("「{name}」的标题与提示词将被删除。"));
-                ui.label(
-                    RichText::new("托管目录里的图片文件会保留（可能被其它示例共用）。")
-                        .color(HEADER_GRAY)
-                        .size(12.0),
-                );
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button("删除").clicked() {
+            let mut close = false;
+            let name = self
+                .current
+                .as_ref()
+                .map(|example| example.display_title().to_string())
+                .unwrap_or_default();
+            theme::modal_shell(ctx, "delete_modal", 340.0, |ui| {
+                theme::modal_title(ui, "删除这条示例？");
+                theme::modal_desc(ui, format!("「{name}」的标题与提示词将被删除。"));
+                theme::modal_desc(ui, "托管目录里的图片文件会保留（可能被其它示例共用）。");
+                ui.add_space(18.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::danger_button(ui, "删除").clicked() {
                         confirm = true;
                     }
-                    if ui.button("取消").clicked() {
+                    if theme::secondary_button(ui, "取消").clicked() {
                         close = true;
                     }
                 });
@@ -1794,43 +2062,153 @@ impl GalleryView {
                 self.delete_current();
                 close = true;
             }
-            if close {
+            if close || escape {
                 self.delete_confirm = false;
             }
         }
 
-        // 导出。
+        // 导出：列表逐条勾选，默认全选（D7/D8）。
         if self.export_open {
             let mut close = false;
             let mut do_export = false;
             let mut browse = false;
-            egui::Modal::new(Id::new("export_modal")).show(ctx, |ui| {
-                ui.set_width(520.0);
-                ui.heading("导出图库");
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(format!(
-                        "把 {} 条示例导出为 JSON + 图片文件的 zip 包。",
-                        self.store.row_count()
-                    ))
-                    .color(HEADER_GRAY)
-                    .size(12.0),
+            theme::modal_shell(ctx, "export_modal", 560.0, |ui| {
+                theme::modal_title(ui, "导出图库");
+                let rows: Vec<(i64, String)> = self
+                    .store
+                    .rows()
+                    .iter()
+                    .map(|row| (row.id, row.display_title().to_string()))
+                    .collect();
+                let selected_count = rows
+                    .iter()
+                    .filter(|(id, _)| self.export_selected.contains(id))
+                    .count();
+                theme::modal_desc(
+                    ui,
+                    format!("已选择 {selected_count} 条示例导出图库"),
                 );
-                ui.add_space(6.0);
+                ui.add_space(12.0);
+
+                egui::Frame::new()
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ScrollArea::vertical()
+                            .id_salt("export_list")
+                            .max_height(260.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                let all = !rows.is_empty() && selected_count == rows.len();
+                                let partial = selected_count > 0 && !all;
+
+                                // 首行：全选 / 清空。
+                                let (rect, response) = ui.allocate_exact_size(
+                                    Vec2::new(ui.available_width(), 32.0),
+                                    Sense::click(),
+                                );
+                                if response.hovered() {
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        CornerRadius::same(4),
+                                        p.row_hover,
+                                    );
+                                }
+                                let checkbox = Rect::from_min_size(
+                                    rect.min + Vec2::new(8.0, 7.0),
+                                    Vec2::splat(18.0),
+                                );
+                                export_checkbox(ui.painter(), checkbox, all, partial, &p);
+                                ui.painter().text(
+                                    egui::pos2(checkbox.right() + 10.0, rect.center().y),
+                                    Align2::LEFT_CENTER,
+                                    "全选",
+                                    FontId::proportional(13.0),
+                                    p.text,
+                                );
+                                if response.clicked() {
+                                    if all {
+                                        self.export_selected.clear();
+                                    } else {
+                                        self.export_selected =
+                                            rows.iter().map(|(id, _)| *id).collect();
+                                    }
+                                }
+
+                                for (id, title) in &rows {
+                                    let checked = self.export_selected.contains(id);
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        Vec2::new(ui.available_width(), 32.0),
+                                        Sense::click(),
+                                    );
+                                    if response.hovered() {
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            CornerRadius::same(4),
+                                            p.row_hover,
+                                        );
+                                    }
+                                    let checkbox = Rect::from_min_size(
+                                        rect.min + Vec2::new(8.0, 7.0),
+                                        Vec2::splat(18.0),
+                                    );
+                                    export_checkbox(
+                                        ui.painter(),
+                                        checkbox,
+                                        checked,
+                                        false,
+                                        &p,
+                                    );
+                                    let galley = ui.painter().layout_no_wrap(
+                                        title.clone(),
+                                        FontId::proportional(13.0),
+                                        p.text,
+                                    );
+                                    ui.painter().galley(
+                                        egui::pos2(
+                                            checkbox.right() + 10.0,
+                                            rect.center().y - galley.size().y * 0.5,
+                                        ),
+                                        galley,
+                                        p.text,
+                                    );
+                                    if response.clicked() {
+                                        if checked {
+                                            self.export_selected.remove(id);
+                                        } else {
+                                            self.export_selected.insert(*id);
+                                        }
+                                    }
+                                }
+                            });
+                    });
+
+                ui.add_space(12.0);
                 ui.horizontal(|ui| {
+                    ui.label(RichText::new("导出地址").size(12.0).color(p.text_muted));
                     ui.add(
                         TextEdit::singleline(&mut self.export_path)
-                            .desired_width(360.0)
+                            .desired_width(380.0)
                             .hint_text("导出路径"),
                     );
-                    browse = ui.button("浏览…").clicked();
+                    if theme::secondary_button(ui, "浏览…").clicked() {
+                        browse = true;
+                    }
                 });
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button("导出").clicked() {
+
+                let live_count = rows
+                    .iter()
+                    .filter(|(id, _)| self.export_selected.contains(id))
+                    .count();
+                ui.add_space(18.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::primary_button_enabled(ui, "导出", live_count > 0).clicked() {
                         do_export = true;
                     }
-                    if ui.button("取消").clicked() {
+                    if theme::secondary_button(ui, "取消").clicked() {
                         close = true;
                     }
                 });
@@ -1851,14 +2229,14 @@ impl GalleryView {
                 }
             } else if do_export {
                 self.export_to(ctx);
-            } else if close {
+            } else if close || escape {
                 self.export_open = false;
             }
         }
     }
 }
 
-/// 底部按钮触发的动作，由闭包收集后在外层统一执行（避免与 self 的借用纠缠）。
+/// 顶部菜单与底栏按钮共用的动作，由闭包收集后在外层统一执行（避免与 self 的借用纠缠）。
 #[derive(Clone, Copy)]
 enum Action {
     Save,
@@ -1881,6 +2259,7 @@ fn section_editor(
     index: SectionIndex,
     locked: bool,
 ) -> bool {
+    let p = theme::Palette::current(ui.ctx());
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         // 标题：灰色、左对齐、不可修改、不可选中。
@@ -1891,7 +2270,7 @@ fn section_editor(
         let row_height = ui.ctx().fonts_mut(|fonts| fonts.row_height(&font));
         let galley =
             ui.painter()
-                .layout_no_wrap(SECTION_TITLES[index].to_string(), font, HEADER_GRAY);
+                .layout_no_wrap(SECTION_TITLES[index].to_string(), font, p.text_muted);
         let head_height = row_height.max(galley.size().y) + 6.0;
         let (head_rect, _) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), head_height),
@@ -1901,7 +2280,7 @@ fn section_editor(
             head_rect.left(),
             head_rect.center().y - galley.size().y * 0.5,
         );
-        ui.painter().galley(text_pos, galley, HEADER_GRAY);
+        ui.painter().galley(text_pos, galley, p.text_muted);
 
         let width = ui.available_width();
         let text = sections
@@ -1927,7 +2306,7 @@ fn section_editor(
             ui.painter().hline(
                 line_rect.x_range(),
                 line_rect.center().y,
-                Stroke::new(1.0, SEAM_COLOR),
+                Stroke::new(1.0, p.border),
             );
             ui.add_space(4.0);
         }
@@ -2055,13 +2434,14 @@ fn paint_sidebar_row(
     opacity: f32,
     elevated: bool,
 ) {
+    let p = theme::Palette::current(ui.ctx());
     let bg = if selected {
-        Color32::from_rgb(48, 62, 88)
+        p.row_selected
     } else if hovered {
-        Color32::from_gray(46)
+        p.row_hover
     } else if elevated {
         // 虚影保持该行自身底色：未选中行平时透明，浮起时给一层浮层底色（§2）。
-        Color32::from_gray(38)
+        p.surface
     } else {
         Color32::TRANSPARENT
     };
@@ -2072,13 +2452,25 @@ fn paint_sidebar_row(
                 offset: [0, 4],
                 blur: 12,
                 spread: 0,
-                color: Color32::from_black_alpha(120),
+                color: p.shadow,
             }
-            .as_shape(rect, CornerRadius::same(5)),
+            .as_shape(rect, CornerRadius::same(6)),
         );
     }
     ui.painter()
-        .rect_filled(rect, CornerRadius::same(5), with_opacity(bg, opacity));
+        .rect_filled(rect, CornerRadius::same(6), with_opacity(bg, opacity));
+    // 选中态：左侧 3pt 竖条（行高 60%），与底色一起标识当前示例。
+    if selected {
+        let bar = Rect::from_min_size(
+            egui::pos2(rect.left() + 3.0, rect.center().y - rect.height() * 0.3),
+            Vec2::new(3.0, rect.height() * 0.6),
+        );
+        ui.painter().rect_filled(
+            bar,
+            CornerRadius::same(2),
+            with_opacity(p.row_selected_bar, opacity),
+        );
+    }
 
     // 缩略图
     let thumb_rect = sidebar_row_thumb_rect(rect);
@@ -2106,14 +2498,14 @@ fn paint_sidebar_row(
         ui.painter().rect_filled(
             thumb_rect,
             CornerRadius::same(4),
-            with_opacity(Color32::from_gray(58), opacity),
+            with_opacity(p.thumb_slot, opacity),
         );
         ui.painter().text(
             thumb_rect.center(),
             egui::Align2::CENTER_CENTER,
             "无图",
             egui::FontId::proportional(11.0),
-            with_opacity(Color32::from_gray(150), opacity),
+            with_opacity(p.text_faint, opacity),
         );
     }
 
@@ -2128,9 +2520,9 @@ fn paint_sidebar_row(
             egui::FontId::proportional(13.5),
             with_opacity(
                 if selected {
-                    Color32::from_gray(238)
+                    p.text_strong
                 } else {
-                    Color32::from_gray(210)
+                    p.text
                 },
                 opacity,
             ),
@@ -2156,7 +2548,7 @@ fn paint_sidebar_row(
             egui::Align2::CENTER_CENTER,
             if locked { "🔒" } else { "🔓" },
             egui::FontId::proportional(13.0),
-            with_opacity(Color32::from_gray(190), opacity),
+            with_opacity(p.text_muted, opacity),
         );
     }
 
@@ -2167,7 +2559,7 @@ fn paint_sidebar_row(
             egui::Align2::RIGHT_BOTTOM,
             "草稿",
             egui::FontId::proportional(10.0),
-            with_opacity(Color32::from_gray(150), opacity),
+            with_opacity(p.text_muted, opacity),
         );
     }
 }
@@ -2178,6 +2570,7 @@ fn paint_sidebar_row(
 /// 文案在行内水平 + 垂直居中（拉宽侧栏后仍居中）；不可拖动、不进落点计算、永不高亮为选中蓝。
 /// 返回本帧是否被点击（点击语义沿用 `self.select(None)`）。
 fn new_example_row(ui: &mut egui::Ui) -> bool {
+    let p = theme::Palette::current(ui.ctx());
     let width = (ui.available_width() - 8.0).max(60.0);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 52.0), Sense::click());
     let hovered = response.hovered();
@@ -2186,18 +2579,10 @@ fn new_example_row(ui: &mut egui::Ui) -> bool {
     }
     ui.painter().rect_filled(
         rect,
-        CornerRadius::same(5),
-        if hovered {
-            Color32::from_gray(46)
-        } else {
-            Color32::TRANSPARENT
-        },
+        CornerRadius::same(6),
+        if hovered { p.row_hover } else { Color32::TRANSPARENT },
     );
-    let color = if hovered {
-        Color32::from_gray(210)
-    } else {
-        HEADER_GRAY
-    };
+    let color = if hovered { p.text } else { p.text_muted };
     let galley = ui.painter().layout_no_wrap(
         "+新示例".to_string(),
         egui::FontId::proportional(13.5),
@@ -2361,8 +2746,7 @@ fn with_opacity(color: Color32, opacity: f32) -> Color32 {
     if opacity >= 1.0 {
         return color;
     }
-    let a = (color.a() as f32 * opacity.clamp(0.0, 1.0)).round() as u8;
-    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a)
+    color.gamma_multiply(opacity.clamp(0.0, 1.0))
 }
 
 /// 把插入下标换算成「移除源元素后」应插入的下标；返回 `None` 表示原地松手、顺序不变。
@@ -2426,48 +2810,174 @@ fn install_cjk_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// 程序图标：深色底 + 白色「图片框」 + 五条分区线，示意「一张图 + 五段提示词」。
+/// 程序图标：调色板蓝底 + 白色相框里的山与太阳（见 src/icon.rs）。
 fn app_icon() -> egui::IconData {
-    const SIZE: usize = 64;
-    let mut rgba = vec![0u8; SIZE * SIZE * 4];
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let i = (y * SIZE + x) * 4;
-            // 竖向渐变底色
-            let t = y as f32 / (SIZE - 1) as f32;
-            let base = (40.0 + t * 24.0) as u8;
-            rgba[i] = base;
-            rgba[i + 1] = (base as f32 + 6.0) as u8;
-            rgba[i + 2] = (base as f32 + 22.0) as u8;
-            rgba[i + 3] = 255;
-        }
+    const SIZE: u32 = 64;
+    egui::IconData {
+        rgba: icon::render(SIZE),
+        width: SIZE,
+        height: SIZE,
     }
-    // 上面一块「图片」占位框
-    for y in 10..30 {
-        for x in 10..54 {
-            let i = (y * SIZE + x) * 4;
-            rgba[i] = 210;
-            rgba[i + 1] = 214;
-            rgba[i + 2] = 220;
-        }
+}
+
+/// 标题栏上的文字按钮：常态无底，悬停 / 按下才显形（D1，自绘标题栏）。
+fn chrome_button(ui: &mut egui::Ui, text: &str, p: &theme::Palette) -> egui::Response {
+    let font = FontId::proportional(13.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), p.text);
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(galley.size().x + 20.0, 28.0), Sense::click());
+    let pressed = response.is_pointer_button_down_on();
+    if pressed {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), p.row_selected);
+    } else if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), p.row_hover);
     }
-    // 下面五条横线代表五个分区
-    for line in 0..5usize {
-        let y0 = 36 + line * 5;
-        for y in y0..(y0 + 2) {
-            for x in 10..54 {
-                let i = (y * SIZE + x) * 4;
-                rgba[i] = 150;
-                rgba[i + 1] = 170;
-                rgba[i + 2] = 205;
+    let color = if pressed { p.text_strong } else { p.text };
+    ui.painter()
+        .text(rect.center(), Align2::CENTER_CENTER, text, font, color);
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// 下拉菜单项：整行可点，选中项右侧画一个 accent 勾。
+fn menu_item(
+    ui: &mut egui::Ui,
+    label: &str,
+    selected: bool,
+    p: &theme::Palette,
+) -> egui::Response {
+    let font = FontId::proportional(13.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), p.text);
+    let width = (galley.size().x + 56.0).max(180.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(4), p.row_hover);
+    }
+    ui.painter().galley(
+        egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        p.text,
+    );
+    if selected {
+        let center = rect.right_center() - Vec2::new(15.0, 0.0);
+        let stroke = Stroke::new(1.6, p.accent);
+        ui.painter().line_segment(
+            [
+                center + Vec2::new(-3.5, 0.0),
+                center + Vec2::new(-1.0, 3.0),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                center + Vec2::new(-1.0, 3.0),
+                center + Vec2::new(4.0, -3.5),
+            ],
+            stroke,
+        );
+    }
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// 导出列表的复选框：18×18 三态自绘（全选 / 部分 / 未选）。
+fn export_checkbox(
+    painter: &egui::Painter,
+    rect: Rect,
+    checked: bool,
+    partial: bool,
+    p: &theme::Palette,
+) {
+    let corner = CornerRadius::same(4);
+    if checked || partial {
+        painter.rect_filled(rect, corner, p.accent);
+        let stroke = Stroke::new(1.8, p.accent_fg);
+        if partial {
+            painter.hline(
+                rect.left() + 4.5..=rect.right() - 4.5,
+                rect.center().y,
+                stroke,
+            );
+        } else {
+            let c = rect.center();
+            painter.line_segment(
+                [c + Vec2::new(-4.5, 0.2), c + Vec2::new(-1.2, 3.6)],
+                stroke,
+            );
+            painter.line_segment(
+                [c + Vec2::new(-1.2, 3.6), c + Vec2::new(4.8, -3.4)],
+                stroke,
+            );
+        }
+    } else {
+        painter.rect_stroke(
+            rect,
+            corner,
+            Stroke::new(1.0, p.border_strong),
+            StrokeKind::Inside,
+        );
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowButton {
+    Minimize,
+    Maximize,
+    Close,
+}
+
+/// 窗口按钮：46×40，贴右边缘；关闭键悬停变危险色。
+fn window_button(ui: &mut egui::Ui, kind: WindowButton, p: &theme::Palette) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(WINDOW_BUTTON_WIDTH, TITLE_BAR_HEIGHT), Sense::click());
+    let hovered = response.hovered();
+    let closing = kind == WindowButton::Close;
+    if hovered {
+        let bg = if closing { p.danger } else { p.row_hover };
+        ui.painter().rect_filled(rect, CornerRadius::ZERO, bg);
+    }
+    let color = if closing && hovered { p.accent_fg } else { p.text };
+    let stroke = Stroke::new(1.0, color);
+    let c = rect.center();
+    let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+    let painter = ui.painter();
+    match kind {
+        WindowButton::Minimize => {
+            painter.hline(c.x - 5.0..=c.x + 5.0, c.y, stroke);
+        }
+        WindowButton::Maximize => {
+            if maximized {
+                let back = Rect::from_center_size(c + Vec2::new(1.5, -1.5), Vec2::splat(7.0));
+                let front = Rect::from_center_size(c + Vec2::new(-1.5, 1.5), Vec2::splat(7.0));
+                painter.rect_stroke(back, CornerRadius::same(1), stroke, StrokeKind::Inside);
+                painter.rect_stroke(front, CornerRadius::same(1), stroke, StrokeKind::Inside);
+            } else {
+                let box_rect = Rect::from_center_size(c, Vec2::splat(10.0));
+                painter.rect_stroke(
+                    box_rect,
+                    CornerRadius::same(1),
+                    stroke,
+                    StrokeKind::Inside,
+                );
             }
         }
+        WindowButton::Close => {
+            painter.line_segment(
+                [c + Vec2::new(-5.0, -5.0), c + Vec2::new(5.0, 5.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [c + Vec2::new(-5.0, 5.0), c + Vec2::new(5.0, -5.0)],
+                stroke,
+            );
+        }
     }
-    egui::IconData {
-        rgba,
-        width: SIZE as u32,
-        height: SIZE as u32,
-    }
+    response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 /// 在资源管理器里打开目录。

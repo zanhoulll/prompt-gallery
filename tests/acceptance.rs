@@ -123,3 +123,68 @@ fn acceptance_export_package_shape() {
         assert!(!data.contains(title), "data.json 不应包含分区标题「{title}」");
     }
 }
+
+/// 两条示例共用一张图，返回 (store, 目录守卫, 按库内顺序的 id)。
+fn store_with_two_examples(tag: &str) -> (Store, TempDir, Vec<i64>) {
+    let temp = TempDir::new(tag);
+    let mut store = Store::open_in(temp.path().to_path_buf()).unwrap();
+    let (hash, ext) = store.store_image_bytes(PNG, "png").unwrap();
+    let mut first = Example::draft(0);
+    first.title = "第一条".into();
+    first.image_hash = Some(hash.clone());
+    first.image_ext = Some(ext.clone());
+    let first_id = store.insert(&mut first).unwrap();
+    let mut second = Example::draft(0);
+    second.title = "第二条".into();
+    second.image_hash = Some(hash);
+    second.image_ext = Some(ext);
+    let second_id = store.insert(&mut second).unwrap();
+    (store, temp, vec![first_id, second_id])
+}
+
+fn read_entry(zip: &mut zip::ZipArchive<fs::File>, name: &str) -> String {
+    let mut text = String::new();
+    zip.by_name(name).unwrap().read_to_string(&mut text).unwrap();
+    text
+}
+
+#[test]
+fn export_ids_writes_only_the_chosen_example() {
+    let (store, temp, ids) = store_with_two_examples("export-selected");
+    let zip_path = temp.path().join("selected.zip");
+    let count = archive::export_ids(&store, &ids[..1], &zip_path).unwrap();
+    assert_eq!(count, 1);
+    let mut zip = zip::ZipArchive::new(fs::File::open(&zip_path).unwrap()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&read_entry(&mut zip, "data.json")).unwrap();
+    let examples = json["examples"].as_array().unwrap();
+    assert_eq!(examples.len(), 1, "只应导出一条示例");
+    assert_eq!(examples[0]["id"], ids[0]);
+    assert_eq!(examples[0]["title"], "第一条");
+}
+
+#[test]
+fn export_ids_keeps_image_dedup_across_the_selection() {
+    let (store, temp, ids) = store_with_two_examples("export-shared-image");
+    let zip_path = temp.path().join("both.zip");
+    let count = archive::export_ids(&store, &ids, &zip_path).unwrap();
+    assert_eq!(count, 2);
+    let mut zip = zip::ZipArchive::new(fs::File::open(&zip_path).unwrap()).unwrap();
+    let names: Vec<String> = (0..zip.len())
+        .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        names.iter().filter(|n| n.starts_with("images/")).count(),
+        1,
+        "同图两条示例只应写一个图片条目：{names:?}"
+    );
+}
+
+#[test]
+fn export_ids_rejects_an_empty_selection() {
+    let (store, temp, _ids) = store_with_two_examples("export-empty");
+    let zip_path = temp.path().join("empty.zip");
+    let err = archive::export_ids(&store, &[], &zip_path).unwrap_err();
+    assert!(err.to_string().contains("没有选择"), "错误文案应说明没有勾选：{err}");
+    assert!(!zip_path.exists(), "失败时不应留下半成品");
+}
+

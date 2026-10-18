@@ -3,6 +3,43 @@
 Prompt Gallery 的所有重要变更都记录在此。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.1.4] - 2026-10-19
+
+一次**整体视觉重做 + 窗口外壳自绘**：关掉系统标题栏，改由应用自绘 40pt 标题栏（图标 / 菜单 / 窗口按钮），颜色从散落的字面量收进深、浅两套色板并支持「跟随系统 / 浅色 / 深色」；导出从「整库打包」变成**可勾选子集**。
+
+### 新增
+
+- **自绘标题栏（Title Bar）**——主窗口改为 `with_decorations(false)` + 透明窗口（`clear_color` 全透明，根框架自绘 10pt 圆角与 1pt 描边，最大化时圆角归零）。顶部 40pt：左侧应用图标与名称、中间「数据管理 / 关于 / 外观」三个 chrome 按钮，右侧 46×40 的最小化 / 最大化还原 / 关闭。按住空白处拖动窗口、双击最大化或还原；八向缩放由 8 个前景热区发 `ViewportCommand::BeginResize` 补回。**明确接受的损失**：系统 Snap Layouts 悬停面板、`Alt+Space` 系统菜单、DWM 窗口阴影不再可用（见 ADR-0009）。
+- **程序化应用图标**——`src/icon_render.rs` 在 256 设计稿里画圆角蓝底 + 白相框 + 天空 / 太阳 / 双层山，按尺寸做 4× / 8× 超采样降采样，圆角外透明；标题栏、窗口图标与 exe 图标资源同源，不读任何图片文件。
+- **exe 内嵌图标资源**——`build.rs` 在构建期把同一份像素生成 `.ico`（16–256 七档）与 `VERSIONINFO`，经 Windows SDK 的 `rc.exe` 编成 `.rsrc` 链进 exe：任务栏按钮、资源管理器与「属性 → 详细信息」从系统默认图标 / 空版本信息变为应用自己的图标与 `Prompt Gallery 0.1.4`（见 ADR-0010）。
+- **外观设置（Appearance）**——「外观」菜单三选一：跟随系统 / 浅色 / 深色，选中立即应用并写入数据目录的 `config.json`（`{"theme":"system|light|dark"}`），下次启动沿用；写失败只在底栏提示，不阻断使用。
+- **导出选择（Export Selection）**——导出弹窗列出全部示例并默认全选：首行三态「全选」（全选 / 部分 / 清空），每行复选框 18×18、整行可点，顶部实时显示「已选择 N 条示例导出图库」；一条都没选时导出按钮置灰。只把勾选的示例与它们用到的图片写进 zip（`archive::export_ids`）。
+
+### 变更
+
+- **底栏精简**——移除「导出图库…」「导入图库…」「打开数据目录」三个按钮：导出 / 导入 / 打开数据目录统一由标题栏「数据管理」菜单进入（单入口）。底栏左侧保留「保存 / 另存为 / 删除 │ 复制提示词」，右侧状态文案与「草稿未保存」不变。
+- **版本号改为纯文本**——底栏最右的 `v0.1.4` 不再是可点按钮（无悬停、无提示），点击不再打开关于弹窗。
+- **关于弹窗只留名称与版本**——删除数据目录路径、复制路径、打开数据目录与归档格式版本行，只显示 `Prompt Gallery` 与版本号。
+- **全局视觉重做**——新增 `src/theme.rs`：19 个色 token 的深 / 浅两套 `Palette`，统一 spacing、控件圆角与描边；五个弹窗共用 `modal_shell`（12pt 圆角、1pt 描边、投影、半透明遮罩），按钮统一为主 / 次 / 危险三态；侧栏选中行改为圆角浅底 + 左侧 3pt 竖条；五分区编辑器、图片框、拖动虚影、锁与草稿角标全部改从色板取色（此前 39 处 `Color32` 字面量全按深色写死）。
+- **版本号** `0.1.3` → `0.1.4`。（`Cargo.toml`）
+
+### 修复
+
+- **切换系统深浅色后浅色模式几乎不可用**——旧代码把画布、面板、文字、选中态等颜色写成深色常量，系统切到浅色时 egui 只换默认样式，应用自绘部分仍是深色底配深色字。现在所有颜色来自 `Palette::current(ctx)`，主题切换当帧重算并重新 apply。
+
+### 测试
+
+- 新增 `src/icon_render.rs` 5 个单测：缓冲区长度随尺寸变化、中心不透明、四角透明、16px 仍能画出白相框、`.ico` 头部条目数与每条偏移 / 长度自洽。
+- 新增 `tests/acceptance.rs` 3 个验收测试：只导出勾选的示例、勾选多条共用图片时 `images/` 仍按内容哈希去重、空选择返回错误且不留下 zip。
+- `cargo test` 全绿、`cargo check --all-targets` 通过；用应用内测试钩子（ADR-0008）实机走查标题栏菜单、最大化 / 还原、关窗草稿拦截、导出勾选与全选三态、浅色 / 深色切换与重启保持。
+
+### 兼容性
+
+- 数据库 schema（`SCHEMA_VERSION`）**仍为 2**、归档格式（`ARCHIVE_VERSION`）**仍为 1**：新增的只是「导出哪些 id」，包内结构与旧版一致，旧包照常导入。
+- **入口迁移**：导出 / 导入 / 打开数据目录从底栏移到标题栏「数据管理」菜单；`Ctrl+S` / `Ctrl+Shift+S` / `Ctrl+R` 快捷键不变。
+- 新增数据文件 `config.json`（仅外观设置，可删；缺失或损坏时静默回退跟随系统）。
+- **构建前置**：要让 exe 带图标资源，构建机需要 Windows SDK 的 `rc.exe`（认 `RC` 环境变量，或 `Windows Kits\10\bin\*\x64\rc.exe` 的最高版本）；缺失时构建仍成功，只是 exe 没有图标资源与版本信息（见 ADR-0010）。
+
 ## [v0.1.3] - 2026-10-16
 
 一次「让改内容像重命名一样自动落库」+ **示例只读锁**，外加三处界面瑕疵清理：选中行悬停时的铅笔豆腐块、`+新示例` 未居中、标题栏冗长。
@@ -29,6 +66,11 @@ Prompt Gallery 的所有重要变更都记录在此。
 
 - 新增 6 个单测：`src/model.rs` 的 `locked_defaults_false_and_is_not_part_of_content_diff`；`src/store.rs` 的 `new_database_has_locked_column_and_version_2`、`old_database_migrates_to_v2_keeping_rows_unlocked`、`locked_rows_reject_update_and_delete_but_reorder_and_unlock_work`；`src/archive.rs` 的 `export_writes_locked_and_old_json_defaults_to_unlocked`、`locked_survives_export_import_roundtrip`。
 - `cargo test` 全绿：核心库 11 → **17** + `src/main.rs` 19 + 验收 1 = **37 项通过**，零 warning；`cargo check --all-targets` 通过。
+
+### 文档
+
+- 新增 `docs/adr/0006-autosave-stored-examples-with-debounce.md`、`docs/adr/0007-example-read-only-lock.md`；ADR-0004 顶部加注「部分被 ADR-0006 取代」。
+- `CONTEXT.md` 新增术语「自动保存 (Autosave)」「锁定 (Locked)」；`docs/ui-layout-map.md` 更新锁图标与图标道、标题上下居中、`+新示例` 居中、底栏「草稿未保存」、标题栏文案；`README.md` 功能与版本同步、补旧库自动升级说明、测试计数不再写死。
 
 ### 兼容性
 
@@ -62,6 +104,7 @@ Prompt Gallery 的所有重要变更都记录在此。
 ### 文档
 
 - `README.md`：长按措辞改为「按住不动约 0.28 秒」（达标前移动会取消），补固定 `+新示例` 行与边缘自动滚动，版本号与测试项数同步更新。
+- `docs/ui-layout-map.md`：以实机截图重新测量，删去计数区、补入固定 `+新示例` 行与虚影 / 自动滚动的图层说明。
 
 ### 兼容性
 
@@ -104,6 +147,7 @@ Prompt Gallery 的所有重要变更都记录在此。
 ### 文档
 
 - 重写 `README.md`：按钮位置、`选择图片…` 已移除、`Ctrl+R` 语义改为内联编辑、保存时入库、版本号与长按 0.28 秒；并把**运行**前置条件（Microsoft Visual C++ 2015–2022 可再发行组件 x64，提供 `VCRUNTIME140.dll`）与对应疑难排查条目补齐，删去与「零外部运行时」矛盾的体积描述。
+- 以实机截图重新测量界面布局（DPI-aware PrintWindow 捕获客户区 1475×950 物理像素、缩放 1.25，逐像素测量后按 1 列 = 6pt、1 行 = 12pt 重绘），删去顶栏相关内容，补入底栏新按钮、关于弹窗与草稿行。
 
 ### 兼容性
 
