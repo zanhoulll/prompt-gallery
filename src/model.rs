@@ -1,80 +1,46 @@
-//! 领域模型：示例（Example）、草稿（Draft）与五个分区（Section）。
+//! 领域模型：示例（Example）、草稿（Draft）与正/负向提示词。
 //!
 //! 术语与 `CONTEXT.md` 的 Language 章节一一对应；本文件是这些术语在代码里的唯一落点。
 
 use std::path::PathBuf;
 
-/// 一个分区在数组里的下标；数组长度恒为 [`SECTION_COUNT`]。
-pub type SectionIndex = usize;
+/// 提示词的来源：决定锁定能否解除（ADR-0012「来源锁」）。
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum PromptSource {
+    /// 用户自己写的，或从别处粘进来的。
+    #[default]
+    Manual,
+    /// 从图片元数据里读出来的；由此派生出永久只读。
+    Image,
+}
 
-/// 分区数量：正向提示词固定由五个分区组成（CONTEXT.md「分区」）。
-pub const SECTION_COUNT: usize = 5;
-
-/// 每个分区的固定标题。灰色、左对齐、不可修改、不可选中；
-/// 复制提示词时被剔除，不进入剪贴板。
-pub const SECTION_TITLES: [&str; SECTION_COUNT] = [
-    "质量与基础",
-    "人物特征",
-    "服装与道具",
-    "姿势与动作",
-    "环境与光影",
-];
-
-/// 一个字对齐五个分区文本的容器。
-///
-/// 用固定长度的数组而不是 `Vec`/`HashMap`：分区标题不可变，任何「少一个/多一个分区」
-/// 在编译期就不可能表达。
-#[derive(Clone, PartialEq, Eq, Default, Debug)]
-pub struct Sections([String; SECTION_COUNT]);
-
-impl Sections {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 越界下标返回空串，避免 UI 层的索引错误把程序打崩。
-    pub fn get(&self, index: SectionIndex) -> &str {
-        self.0.get(index).map(String::as_str).unwrap_or("")
-    }
-
-    pub fn get_mut(&mut self, index: SectionIndex) -> Option<&mut String> {
-        self.0.get_mut(index)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (SectionIndex, &str)> {
-        self.0.iter().enumerate().map(|(i, s)| (i, s.as_str()))
-    }
-
-    /// 五个分区是否全为空。
-    pub fn is_empty(&self) -> bool {
-        self.0.iter().all(|s| s.trim().is_empty())
-    }
-
-    /// 拼出可复制的正向提示词：只含正文，不含分区标题，不含分隔符。
-    ///
-    /// 空分区被跳过，分区之间以单个空行分隔，结果首尾无多余空白。
-    pub fn join_for_clipboard(&self) -> String {
-        let mut out = String::new();
-        for text in self.0.iter() {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if !out.is_empty() {
-                out.push_str("\n\n");
-            }
-            out.push_str(trimmed);
+impl PromptSource {
+    /// 写进数据库 / `data.json` 的稳定字符串。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Image => "image",
         }
-        out
     }
 
-    /// 是否与另一组分区文本内容相同（忽略首尾空白）。
-    pub fn same_content_as(&self, other: &Sections) -> bool {
-        (0..SECTION_COUNT).all(|i| self.get(i).trim() == other.get(i).trim())
+    /// 读库时的宽松解析：认不出的一律当 `Manual`。
+    ///
+    /// 宁可少锁，也不把一条读不懂的旧记录判成解不开的死锁。
+    pub fn from_str_loose(raw: &str) -> Self {
+        if raw.trim().eq_ignore_ascii_case("image") {
+            Self::Image
+        } else {
+            Self::Manual
+        }
+    }
+
+    /// 是否为来源锁：界面不画解锁按钮，`Store::set_locked(false)` 拒绝。
+    pub fn is_locked_source(self) -> bool {
+        self == Self::Image
     }
 }
 
-/// 图库中的一条示例：一个标题、一张图片、五个分区的文本。
+/// 图库中的一条示例：一个标题、一张图片、一段正向提示词、一段负向提示词。
 #[derive(Clone, Debug)]
 pub struct Example {
     /// SQLite 主键；未落库的草稿为 `None`。
@@ -87,7 +53,12 @@ pub struct Example {
     pub image_hash: Option<String>,
     /// 图片文件扩展名，与 `image_hash` 成对出现。
     pub image_ext: Option<String>,
-    pub sections: Sections,
+    /// 正向提示词：一段连续文本，不再分区（ADR-0011）。
+    pub positive: String,
+    /// 负向提示词：单段、可留空，与正向同权。
+    pub negative: String,
+    /// 提示词来源；`Image` 时 `locked` 必然为 `true`（ADR-0012）。
+    pub prompt_source: PromptSource,
     pub created_at: i64,
     pub updated_at: i64,
     /// 只读锁：锁定的示例不能被修改或删除（ADR-0007）。
@@ -103,7 +74,9 @@ impl Default for Example {
             title: String::new(),
             image_hash: None,
             image_ext: None,
-            sections: Sections::new(),
+            positive: String::new(),
+            negative: String::new(),
+            prompt_source: PromptSource::Manual,
             created_at: now,
             updated_at: now,
             locked: false,
@@ -148,15 +121,21 @@ impl Example {
         self.image_file_name().map(|name| images_dir.join(name))
     }
 
+    /// 两段提示词是否都为空。
+    pub fn prompts_empty(&self) -> bool {
+        self.positive.trim().is_empty() && self.negative.trim().is_empty()
+    }
+
     /// 是否内容为空——空示例不值得落库。
     pub fn is_blank(&self) -> bool {
-        self.title.trim().is_empty() && self.sections.is_empty() && self.image_hash.is_none()
+        self.title.trim().is_empty() && self.prompts_empty() && self.image_hash.is_none()
     }
 
     /// 与基线（数据库里的那一份）相比是否有未保存的改动。
     pub fn differs_from(&self, baseline: &Example) -> bool {
         self.title.trim() != baseline.title.trim()
-            || !self.sections.same_content_as(&baseline.sections)
+            || self.positive.trim() != baseline.positive.trim()
+            || self.negative.trim() != baseline.negative.trim()
             || self.image_hash != baseline.image_hash
             || self.image_ext != baseline.image_ext
     }
@@ -211,20 +190,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clipboard_text_has_no_section_headers() {
-        let mut sections = Sections::new();
-        sections.get_mut(0).unwrap().push_str("  masterpiece, best quality  ");
-        sections.get_mut(3).unwrap().push_str("standing");
-        let text = sections.join_for_clipboard();
-        assert_eq!(text, "masterpiece, best quality\n\nstanding");
-        for title in SECTION_TITLES {
-            assert!(!text.contains(title));
+    fn prompt_source_roundtrips_and_is_lenient() {
+        assert_eq!(PromptSource::Manual.as_str(), "manual");
+        assert_eq!(PromptSource::Image.as_str(), "image");
+        for source in [PromptSource::Manual, PromptSource::Image] {
+            assert_eq!(PromptSource::from_str_loose(source.as_str()), source);
         }
-    }
-
-    #[test]
-    fn empty_sections_copy_to_empty_string() {
-        assert!(Sections::new().join_for_clipboard().is_empty());
+        // 读不懂的值不许变成死锁。
+        assert_eq!(PromptSource::from_str_loose(""), PromptSource::Manual);
+        assert_eq!(PromptSource::from_str_loose("IMAGE "), PromptSource::Image);
+        assert_eq!(PromptSource::from_str_loose("weird"), PromptSource::Manual);
+        assert!(PromptSource::Image.is_locked_source());
+        assert!(!PromptSource::Manual.is_locked_source());
+        assert_eq!(PromptSource::default(), PromptSource::Manual);
     }
 
     #[test]
@@ -246,5 +224,25 @@ mod tests {
         // 开关锁不算内容改动（ADR-0007）。
         example.locked = true;
         assert!(!example.differs_from(&baseline));
+    }
+
+    #[test]
+    fn both_prompts_take_part_in_blank_and_diff() {
+        let mut example = Example::default();
+        assert!(example.is_blank());
+
+        example.positive = "  masterpiece  ".into();
+        assert!(!example.is_blank());
+
+        let baseline = example.clone();
+        assert!(!example.differs_from(&baseline));
+
+        example.negative = "lowres".into();
+        assert!(example.differs_from(&baseline));
+
+        // 只改空白不算改动。
+        let mut spaced = baseline.clone();
+        spaced.positive = "masterpiece\n\n".into();
+        assert!(!spaced.differs_from(&baseline));
     }
 }

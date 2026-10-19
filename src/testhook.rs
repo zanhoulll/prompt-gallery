@@ -36,6 +36,8 @@ mod imp {
         Key { key: Key, ctrl: bool, shift: bool, alt: bool },
         Shot { name: String },
         Wait { ms: u64 },
+        /// 让应用走一遍「选了一张图」的入库路径（原生文件对话框无法被合成输入驱动）。
+        Image { path: String },
         Quit,
     }
 
@@ -51,6 +53,7 @@ mod imp {
                 Command::Key { .. } => "key",
                 Command::Shot { .. } => "shot",
                 Command::Wait { .. } => "wait",
+                Command::Image { .. } => "image",
                 Command::Quit => "quit",
             }
         }
@@ -84,6 +87,9 @@ mod imp {
         pending_responses: VecDeque<String>,
         awaiting_shot: Option<AwaitingShot>,
         wait_until: Option<(u64, Instant, Instant)>,
+        /// 已交给应用的「选图」请求（应用处理完自己应答）。
+        image_request: Option<(u64, String, Instant)>,
+        image_started: Option<(u64, Instant)>,
         /// 保活脉冲线程的停止开关；见 start_pulse。
         pulse: Option<Arc<AtomicBool>>,
     }
@@ -120,6 +126,8 @@ mod imp {
                 pending_responses: VecDeque::new(),
                 awaiting_shot: None,
                 wait_until: None,
+                image_request: None,
+                image_started: None,
                 pulse: None,
             })
         }
@@ -211,6 +219,10 @@ mod imp {
                         current.started,
                     ));
                 }
+                Command::Image { path } => {
+                    // 真正的处理在应用侧（它才知道当前示例与锁状态），这里只把请求递过去。
+                    self.image_request = Some((current.seq, path, current.started));
+                }
                 Command::Quit => {
                     self.push_response(current.seq, "quit", Ok(String::new()), current.started);
                     self.flush_responses();
@@ -227,6 +239,20 @@ mod imp {
                         self.current = Some(current);
                     }
                 }
+            }
+        }
+
+        /// 取出待处理的「选图」请求（应用每帧开头调用）。
+        pub fn take_image_request(&mut self) -> Option<(u64, String)> {
+            let (seq, path, started) = self.image_request.take()?;
+            self.image_started = Some((seq, started));
+            Some((seq, path))
+        }
+
+        /// 应用走完选图路径后应答；`result` 只用于轨迹记录，不影响场景执行。
+        pub fn finish_image_request(&mut self, result: Result<String, String>) {
+            if let Some((seq, started)) = self.image_started.take() {
+                self.push_response(seq, "image", result, started);
             }
         }
 
@@ -321,6 +347,7 @@ mod imp {
                 })
             }
             "shot" => Ok(Command::Shot { name: string_field(obj, "name")? }),
+            "image" => Ok(Command::Image { path: string_field(obj, "path")? }),
             "wait" => {
                 let ms = obj
                     .get("ms")
@@ -401,7 +428,7 @@ mod imp {
                 frames.push_back(vec![key_event(*key, false, modifiers)]);
                 frames.push_back(vec![Event::ModifiersChanged(Modifiers::NONE)]);
             }
-            Command::Shot { .. } | Command::Wait { .. } | Command::Quit => {}
+            Command::Shot { .. } | Command::Wait { .. } | Command::Image { .. } | Command::Quit => {}
         }
         frames
     }
@@ -500,6 +527,12 @@ impl TestHook {
     }
 
     pub fn tick(&mut self, _ctx: &egui::Context, _raw_input: &mut egui::RawInput) {}
+
+    pub fn take_image_request(&mut self) -> Option<(u64, String)> {
+        None
+    }
+
+    pub fn finish_image_request(&mut self, _result: Result<String, String>) {}
 }
 
 #[cfg(all(test, debug_assertions))]
@@ -535,6 +568,10 @@ mod tests {
         );
         assert_eq!(parse(r#"{"cmd":"shot","name":"K1-hover"}"#), Command::Shot { name: "K1-hover".to_string() });
         assert_eq!(parse(r#"{"cmd":"wait","ms":700}"#), Command::Wait { ms: 700 });
+        assert_eq!(
+            parse(r#"{"cmd":"image","path":"E:/tmp/a.png"}"#),
+            Command::Image { path: "E:/tmp/a.png".to_string() }
+        );
         assert_eq!(parse(r#"{"cmd":"quit"}"#), Command::Quit);
     }
 

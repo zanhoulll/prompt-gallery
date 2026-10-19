@@ -1,4 +1,4 @@
-//! 数据库（Database）：一个 SQLite 文件存示例元数据与各分区文本，
+//! 数据库（Database）：一个 SQLite 文件存示例元数据与正/负向提示词，
 //! 一个托管 `images/` 目录存图片文件，以内容哈希命名、天然去重（ADR-0003）。
 //!
 //! 两者整体位于程序目录旁的 `data/` 下；默认落在 `%APPDATA%\PromptGallery\`，
@@ -10,16 +10,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::model::{now_unix, Example, Sections, SECTION_COUNT};
+use crate::model::{now_unix, Example, PromptSource};
 
 /// 数据库文件名。
 pub const DB_FILE_NAME: &str = "gallery.sqlite3";
 /// 托管图片目录名。
 pub const IMAGES_DIR_NAME: &str = "images";
 /// 当前 schema 版本，写入 SQLite 的 `PRAGMA user_version`。
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
-/// 索引用的轻量条目：侧边栏只需要标题与图片，不必把五个分区文本全读出来。
+/// 索引用的轻量条目：侧边栏只需要标题、图片与锁标记，不必把两段文本全读出来。
 #[derive(Clone, Debug)]
 pub struct Row {
     pub id: i64,
@@ -28,6 +28,8 @@ pub struct Row {
     pub image_ext: Option<String>,
     /// 只读锁（ADR-0007）。
     pub locked: bool,
+    /// 提示词来源；`Image` 时侧栏锁图标取强调色（ADR-0012）。
+    pub prompt_source: PromptSource,
 }
 
 impl Row {
@@ -117,31 +119,31 @@ impl Store {
 
     /// 按 id 读取一条完整示例。
     pub fn load(&self, id: i64) -> Result<Option<Example>> {
-        let mut example = self
+        let example = self
             .conn
             .query_row(
-                "SELECT id, position, title, image_hash, image_ext, locked, created_at, updated_at
+                "SELECT id, position, title, image_hash, image_ext, positive, negative,
+                        prompt_source, locked, created_at, updated_at
                  FROM examples WHERE id = ?1",
                 params![id],
                 |row| {
+                    let source: String = row.get(7)?;
                     Ok(Example {
                         id: Some(row.get(0)?),
                         position: row.get(1)?,
                         title: row.get(2)?,
                         image_hash: row.get(3)?,
                         image_ext: row.get(4)?,
-                        sections: Sections::new(),
-                        locked: row.get(5)?,
-                        created_at: row.get(6)?,
-                        updated_at: row.get(7)?,
+                        positive: row.get(5)?,
+                        negative: row.get(6)?,
+                        prompt_source: PromptSource::from_str_loose(&source),
+                        locked: row.get(8)?,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
                     })
                 },
             )
             .optional()?;
-
-        if let Some(example) = example.as_mut() {
-            load_sections(&self.conn, example)?;
-        }
         Ok(example)
     }
 
@@ -173,11 +175,14 @@ impl Store {
         if !at_top && example.position == 0 && self.row_count() > 0 {
             example.position = self.next_position();
         }
-        let sections = example.sections.clone();
+        let positive = example.positive.clone();
+        let negative = example.negative.clone();
         let title = example.title.trim().to_string();
         let image_hash = example.image_hash.clone();
         let image_ext = example.image_ext.clone();
-        let locked = example.locked;
+        // 来源锁是派生锁：source = image 时 locked 必然为真（ADR-0012）。
+        let locked = example.locked || example.prompt_source.is_locked_source();
+        let source = example.prompt_source.as_str();
         let mut position = example.position;
 
         let tx = self.conn.transaction()?;
@@ -189,34 +194,45 @@ impl Store {
         let id = match forced_id {
             Some(id) => {
                 tx.execute(
-                    "INSERT INTO examples (id, position, title, image_hash, image_ext, locked, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-                    params![id, position, title, image_hash, image_ext, locked, now],
+                    "INSERT INTO examples (id, position, title, image_hash, image_ext, positive,
+                                           negative, prompt_source, locked, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                    params![
+                        id, position, title, image_hash, image_ext, positive, negative, source,
+                        locked, now
+                    ],
                 )?;
                 id
             }
             None => {
                 tx.execute(
-                    "INSERT INTO examples (position, title, image_hash, image_ext, locked, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                    params![position, title, image_hash, image_ext, locked, now],
+                    "INSERT INTO examples (position, title, image_hash, image_ext, positive,
+                                           negative, prompt_source, locked, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                    params![
+                        position, title, image_hash, image_ext, positive, negative, source, locked,
+                        now
+                    ],
                 )?;
                 tx.last_insert_rowid()
             }
         };
-        write_sections_tx(&tx, id, &sections)?;
         tx.commit()?;
 
         example.id = Some(id);
         example.position = position;
         example.title = title;
+        example.locked = locked;
         example.created_at = now;
         example.updated_at = now;
         self.reload_rows()?;
         Ok(id)
     }
 
-    /// 更新已落库示例的标题、分区文本与图片。
+    /// 更新已落库示例的标题、两段提示词与图片。
+    ///
+    /// 不改 `prompt_source`：它在来源写入时定下，且 `source = image` 的行必然锁定，
+    /// 走不到这里。
     pub fn update(&mut self, example: &mut Example) -> Result<()> {
         let Some(id) = example.id else {
             anyhow::bail!("不能更新未落库的草稿");
@@ -228,17 +244,15 @@ impl Store {
         let title = example.title.trim().to_string();
         let image_hash = example.image_hash.clone();
         let image_ext = example.image_ext.clone();
-        let sections = example.sections.clone();
+        let positive = example.positive.clone();
+        let negative = example.negative.clone();
 
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "UPDATE examples SET title = ?2, image_hash = ?3, image_ext = ?4, updated_at = ?5
+        self.conn.execute(
+            "UPDATE examples SET title = ?2, image_hash = ?3, image_ext = ?4, positive = ?5,
+                    negative = ?6, updated_at = ?7
              WHERE id = ?1",
-            params![id, title, image_hash, image_ext, now],
+            params![id, title, image_hash, image_ext, positive, negative, now],
         )?;
-        tx.execute("DELETE FROM sections WHERE example_id = ?1", params![id])?;
-        write_sections_tx(&tx, id, &sections)?;
-        tx.commit()?;
 
         example.title = title;
         example.updated_at = now;
@@ -246,9 +260,27 @@ impl Store {
         Ok(())
     }
 
+    /// 只改标题，不碰提示词与图片（改名不受任何锁影响）。
+    ///
+    /// 锁保护的是内容：来源锁示例的提示词解不开，但条目本身仍可命名——
+    /// 否则程序读进来的示例只能叫「未命名示例」，用户也没有别的入口改它。
+    pub fn rename(&mut self, id: i64, title: &str) -> Result<()> {
+        let now = now_unix();
+        let title = title.trim().to_string();
+        self.conn.execute(
+            "UPDATE examples SET title = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, title, now],
+        )?;
+        self.reload_rows()?;
+        Ok(())
+    }
+
     /// 删除示例。图片文件是内容寻址、可能被多条示例共享，因此保留不删。
+    ///
+    /// 来源锁示例可以被删除：锁拦的是「手改程序读出的提示词」，不是条目的生死；
+    /// 手动锁仍然拦删除（ADR-0007），因为再点一下锁就可以解开。
     pub fn delete(&mut self, id: i64) -> Result<()> {
-        if self.is_locked(id)? {
+        if self.is_locked(id)? && self.prompt_source(id)? != PromptSource::Image {
             anyhow::bail!("示例已锁定，无法删除");
         }
         self.conn
@@ -274,12 +306,67 @@ impl Store {
     ///
     /// 只写 locked 与 updated_at，故意不走 Store::update——否则会被自身的
     /// 锁定校验挡住。拖动排序（Store::reorder）不受锁影响。
+    ///
+    /// 来源锁（ADR-0012）只挡解锁方向：`source = image` 时传 `false` 直接报错。
     pub fn set_locked(&mut self, id: i64, locked: bool) -> Result<()> {
+        if !locked && self.prompt_source(id)? == PromptSource::Image {
+            anyhow::bail!("提示词来自图片，无法解锁");
+        }
         let now = now_unix();
         self.conn.execute(
             "UPDATE examples SET locked = ?2, updated_at = ?3 WHERE id = ?1",
             params![id, locked, now],
         )?;
+        self.reload_rows()?;
+        Ok(())
+    }
+
+    /// 该示例的提示词来源；不存在的 id 视为 `Manual`。
+    fn prompt_source(&self, id: i64) -> Result<PromptSource> {
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT prompt_source FROM examples WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(raw
+            .map(|s| PromptSource::from_str_loose(&s))
+            .unwrap_or(PromptSource::Manual))
+    }
+
+    /// 新图片带回了提示词：一条 UPDATE 同时写图片、两段文本、来源与锁（ADR-0012）。
+    ///
+    /// 故意绕过 [`Store::update`] 的锁定校验——来源锁正是由这次写入建立的；
+    /// 一条语句也避免了「图片已换、文本未换」的中间态。
+    pub fn apply_image_prompt(
+        &mut self,
+        id: i64,
+        image_hash: &str,
+        image_ext: &str,
+        positive: &str,
+        negative: &str,
+    ) -> Result<()> {
+        let now = now_unix();
+        let affected = self.conn.execute(
+            "UPDATE examples
+                SET image_hash = ?2, image_ext = ?3, positive = ?4, negative = ?5,
+                    prompt_source = ?6, locked = 1, updated_at = ?7
+              WHERE id = ?1",
+            params![
+                id,
+                image_hash,
+                image_ext,
+                positive,
+                negative,
+                PromptSource::Image.as_str(),
+                now
+            ],
+        )?;
+        if affected == 0 {
+            anyhow::bail!("示例不存在：{id}");
+        }
         self.reload_rows()?;
         Ok(())
     }
@@ -330,16 +417,19 @@ impl Store {
     /// 重新读取侧边栏列表。
     fn reload_rows(&mut self) -> Result<()> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, image_hash, image_ext, locked FROM examples ORDER BY position ASC, id ASC",
+            "SELECT id, title, image_hash, image_ext, locked, prompt_source
+             FROM examples ORDER BY position ASC, id ASC",
         )?;
         let rows = stmt
             .query_map([], |row| {
+                let source: String = row.get(5)?;
                 Ok(Row {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     image_hash: row.get(2)?,
                     image_ext: row.get(3)?,
                     locked: row.get(4)?,
+                    prompt_source: PromptSource::from_str_loose(&source),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -348,82 +438,78 @@ impl Store {
     }
 }
 
-/// 建表并迁移到 [`SCHEMA_VERSION`]。
+/// 0.1.x 的老库是否一条数据都没有（没有示例、也没有分区文本）。
+///
+/// 只有这种库才允许静默重建：没有内容可丢，报错只会让人以为程序坏了。
+fn legacy_library_is_empty(conn: &Connection) -> Result<bool> {
+    for table in ["examples", "sections"] {
+        let exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            continue;
+        }
+        let rows: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))?;
+        if rows > 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// 建表；旧库直接报错（ADR-0011：0.2.0 不提供迁移）。
 fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version >= SCHEMA_VERSION {
         return Ok(());
     }
-    if version == 0 {
-        // 新库：直接按 v2 的形状建表。
-        conn.execute_batch(
-            "BEGIN;
-             CREATE TABLE IF NOT EXISTS examples (
-                 id          INTEGER PRIMARY KEY,
-                 position    INTEGER NOT NULL DEFAULT 0,
-                 title       TEXT    NOT NULL DEFAULT '',
-                 image_hash  TEXT,
-                 image_ext   TEXT,
-                 locked      INTEGER NOT NULL DEFAULT 0,
-                 created_at  INTEGER NOT NULL DEFAULT 0,
-                 updated_at  INTEGER NOT NULL DEFAULT 0
-             );
-             CREATE INDEX IF NOT EXISTS idx_examples_position ON examples(position);
-             -- 分区文本按索引 0..4 存行；分区标题是 UI 常量，不入库。
-             CREATE TABLE IF NOT EXISTS sections (
-                 example_id INTEGER NOT NULL REFERENCES examples(id) ON DELETE CASCADE,
-                 section_index INTEGER NOT NULL,
-                 text       TEXT    NOT NULL DEFAULT '',
-                 PRIMARY KEY (example_id, section_index)
-             );
-             PRAGMA user_version = 2;
-             COMMIT;",
-        )
-        .context("初始化数据库 schema 失败")?;
-    } else {
-        // 旧库（v1）：只补 locked 列；已有示例全部保持未锁，数据不动，只跑一次。
-        conn.execute_batch(
-            "BEGIN;
-             ALTER TABLE examples ADD COLUMN locked INTEGER NOT NULL DEFAULT 0;
-             PRAGMA user_version = 2;
-             COMMIT;",
-        )
-        .context("升级数据库 schema 到 v2 失败")?;
-    }
-    Ok(())
-}
-
-fn write_sections_tx(
-    tx: &rusqlite::Transaction<'_>,
-    example_id: i64,
-    sections: &Sections,
-) -> Result<()> {
-    let mut stmt = tx.prepare(
-        "INSERT INTO sections (example_id, section_index, text) VALUES (?1, ?2, ?3)",
-    )?;
-    for (index, text) in sections.iter() {
-        // 空分区不落行，读回时按空串补齐。
-        if text.trim().is_empty() {
-            continue;
-        }
-        stmt.execute(params![example_id, index as i64, text])?;
-    }
-    Ok(())
-}
-
-fn load_sections(conn: &Connection, example: &mut Example) -> Result<()> {
-    let mut stmt = conn.prepare("SELECT section_index, text FROM sections WHERE example_id = ?1")?;
-    let rows = stmt.query_map(params![example.id], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (index, text) = row?;
-        if index >= 0 && (index as usize) < SECTION_COUNT {
-            if let Some(slot) = example.sections.get_mut(index as usize) {
-                *slot = text;
-            }
+    if version > 0 {
+        // 空的 0.1.x 库（装过一次但没存过示例）没有数据要保，直接按 v3 形状重建：
+        // 否则「点开就报错、什么都没丢」会被当成坏掉。
+        if legacy_library_is_empty(conn)? {
+            conn.execute_batch(
+                "BEGIN;
+                 DROP TABLE IF EXISTS sections;
+                 DROP TABLE IF EXISTS example_images;
+                 DROP TABLE IF EXISTS examples;
+                 COMMIT;",
+            )
+            .context("清理空的 0.1.x 库失败")?;
+        } else {
+            anyhow::bail!(
+                "数据库 schema 是 v{version}，0.2.0（v{SCHEMA_VERSION}）不提供迁移。\n\
+                 0.2.0 把「五段分区」合并成一段正向提示词，并新增负向提示词；\n\
+                 旧库无法自动换算，硬转会永久丢掉分区边界。\n\
+                 \n\
+                 请先退出程序，把数据目录改名留作备份\n\
+                 （例如 PromptGallery 改为 PromptGallery-0.1.4），再重新启动；\n\
+                 程序会在原位置建一个空库。"
+            );
         }
     }
+    // 新库：直接按 v3 的形状建表。
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE IF NOT EXISTS examples (
+             id            INTEGER PRIMARY KEY,
+             position      INTEGER NOT NULL DEFAULT 0,
+             title         TEXT    NOT NULL DEFAULT '',
+             image_hash    TEXT,
+             image_ext     TEXT,
+             positive      TEXT    NOT NULL DEFAULT '',
+             negative      TEXT    NOT NULL DEFAULT '',
+             prompt_source TEXT    NOT NULL DEFAULT 'manual',
+             locked        INTEGER NOT NULL DEFAULT 0,
+             created_at    INTEGER NOT NULL DEFAULT 0,
+             updated_at    INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX IF NOT EXISTS idx_examples_position ON examples(position);
+         PRAGMA user_version = 3;
+         COMMIT;",
+    )
+    .context("初始化数据库 schema 失败")?;
     Ok(())
 }
 
@@ -527,17 +613,17 @@ mod tests {
         example.title = "  测试示例  ".to_string();
         example.image_hash = Some(hash.clone());
         example.image_ext = Some(ext.clone());
-        example.sections.get_mut(0).unwrap().push_str("best quality");
-        example.sections.get_mut(4).unwrap().push_str("rim light");
+        example.positive = "best quality, rim light".to_string();
+        example.negative = "  lowres  ".to_string();
 
         let id = store.insert(&mut example).unwrap();
         assert!(id > 0);
 
         let loaded = store.load(id).unwrap().unwrap();
         assert_eq!(loaded.title, "测试示例");
-        assert_eq!(loaded.sections.get(0), "best quality");
-        assert_eq!(loaded.sections.get(4), "rim light");
-        assert_eq!(loaded.sections.get(1), "");
+        assert_eq!(loaded.positive, "best quality, rim light");
+        assert_eq!(loaded.negative, "  lowres  ");
+        assert_eq!(loaded.prompt_source, PromptSource::Manual);
         assert_eq!(loaded.image_file_name(), Some(format!("{hash}.png")));
 
         // 同一份字节再存一次不应产生新文件。
@@ -601,54 +687,168 @@ mod tests {
     }
 
     #[test]
-    fn new_database_has_locked_column_and_version_2() {
+    fn new_database_is_v3_with_prompt_columns_and_no_sections_table() {
         let dir = TempDir::new("schema-new");
         let _store = Store::open_in(dir.path().to_path_buf()).unwrap();
         let conn = Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
-        // SELECT locked 能跑通即证明列存在。
+        assert_eq!(version, 3);
+        // SELECT 能跑通即证明三列都存在。
         let count: i64 = conn
-            .query_row("SELECT COUNT(locked) FROM examples", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(locked), COUNT(positive), COUNT(negative), COUNT(prompt_source)
+                 FROM examples",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 0);
+        let sections: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sections'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sections, 0, "0.2.0 不应再有 sections 表");
     }
 
     #[test]
-    fn old_database_migrates_to_v2_keeping_rows_unlocked() {
-        let dir = TempDir::new("schema-old");
-        // TempDir 只算路径、不建目录；手工造库前先建好。
+    fn empty_old_database_is_rebuilt_instead_of_refused() {
+        let dir = TempDir::new("schema-old-empty");
         fs::create_dir_all(dir.path()).unwrap();
         let db_path = dir.path().join(DB_FILE_NAME);
         {
-            // 手工造一个 v1 旧库：没有 locked 列。
+            // 装过 0.1.x 但一条示例都没存：这种库不该报错拦人。
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch(
                 "CREATE TABLE examples (
                      id INTEGER PRIMARY KEY, position INTEGER NOT NULL DEFAULT 0,
                      title TEXT NOT NULL DEFAULT '', image_hash TEXT, image_ext TEXT,
+                     locked INTEGER NOT NULL DEFAULT 0,
                      created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0);
                  CREATE TABLE sections (
-                     example_id INTEGER NOT NULL REFERENCES examples(id) ON DELETE CASCADE,
-                     section_index INTEGER NOT NULL, text TEXT NOT NULL DEFAULT '',
-                     PRIMARY KEY (example_id, section_index));
-                 INSERT INTO examples (id, position, title) VALUES (7, 0, '旧示例');
-                 PRAGMA user_version = 1;",
+                     example_id INTEGER NOT NULL, section_index INTEGER NOT NULL,
+                     text TEXT NOT NULL DEFAULT '', PRIMARY KEY (example_id, section_index));
+                 PRAGMA user_version = 2;",
             )
             .unwrap();
         }
-        let store = Store::open_in(dir.path().to_path_buf()).unwrap();
+        let store = Store::open_in(dir.path().to_path_buf()).expect("空旧库应被静默重建");
+        assert!(store.rows().is_empty());
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2, "旧库应升级到 v2");
-        let loaded = store.load(7).unwrap().unwrap();
-        assert_eq!(loaded.title, "旧示例", "迁移不应丢数据");
-        assert!(!loaded.locked, "老示例迁移后应保持未锁");
-        assert_eq!(store.row_count(), 1);
+        assert_eq!(version, SCHEMA_VERSION);
+        let sections: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sections'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sections, 0, "重建后不应留 sections 表");
+    }
+
+    #[test]
+    fn old_database_is_rejected_with_actionable_error() {
+        let dir = TempDir::new("schema-old");
+        // TempDir 只算路径、不建目录；手工造库前先建好。
+        fs::create_dir_all(dir.path()).unwrap();
+        let db_path = dir.path().join(DB_FILE_NAME);
+        {
+            // 手工造一个 v2 旧库：五分区 schema 的最后一版。
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE examples (
+                     id INTEGER PRIMARY KEY, position INTEGER NOT NULL DEFAULT 0,
+                     title TEXT NOT NULL DEFAULT '', image_hash TEXT, image_ext TEXT,
+                     locked INTEGER NOT NULL DEFAULT 0,
+                     created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE sections (
+                     example_id INTEGER NOT NULL, section_index INTEGER NOT NULL,
+                     text TEXT NOT NULL DEFAULT '', PRIMARY KEY (example_id, section_index));
+                 INSERT INTO examples (id, title) VALUES (1, '有数据的旧示例');
+                 INSERT INTO sections (example_id, section_index, text) VALUES (1, 0, '质量词');
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        // 不迁移、也不许硬转：库的打开必须失败，且信息要能照着做。
+        let err = Store::open_in(dir.path().to_path_buf())
+            .err()
+            .expect("旧库必须被拒绝");
+        let message = format!("{err:#}");
+        assert!(message.contains("v2"), "错误信息应指出库的版本：{message}");
+        assert!(
+            message.contains("不提供迁移"),
+            "错误信息应说明本版不迁移：{message}"
+        );
+        assert!(
+            message.contains("PromptGallery-0.1.4"),
+            "错误信息应给出可执行的处置办法：{message}"
+        );
+    }
+
+    #[test]
+    fn image_sourced_prompt_locks_and_cannot_be_unlocked() {
+        let dir = TempDir::new("source-lock");
+        let mut store = Store::open_in(dir.path().to_path_buf()).unwrap();
+        let mut example = Example::draft(0);
+        example.title = "从图片读的".into();
+        example.positive = "旧内容".into();
+        let id = store.insert(&mut example).unwrap();
+        assert!(!store.rows()[0].locked);
+
+        store
+            .apply_image_prompt(id, "hash", "png", "新正向", "新负向")
+            .unwrap();
+        assert!(store.rows()[0].locked, "来源锁写库后必须同时上锁");
+        assert_eq!(store.rows()[0].prompt_source, PromptSource::Image);
+
+        // 来源锁只挡解锁方向。
+        assert!(store.set_locked(id, false).is_err(), "来源锁不允许解锁");
+        assert!(store.rows()[0].locked);
+        assert!(store.set_locked(id, true).is_ok(), "重复上锁不算错");
+
+        let loaded = store.load(id).unwrap().unwrap();
+        assert_eq!(loaded.positive, "新正向");
+        assert_eq!(loaded.negative, "新负向");
+        assert_eq!(loaded.image_file_name(), Some("hash.png".to_string()));
+        assert_eq!(loaded.prompt_source, PromptSource::Image);
+        assert!(loaded.locked);
+    }
+
+    #[test]
+    fn source_locked_rows_can_be_renamed_and_deleted_but_not_edited() {
+        let dir = TempDir::new("source-lock-title");
+        let mut store = Store::open_in(dir.path().to_path_buf()).unwrap();
+        let id = store.insert(&mut Example::draft(0)).unwrap();
+        store
+            .apply_image_prompt(id, "hash", "png", "正向", "负向")
+            .unwrap();
+        assert!(store.rows()[0].locked);
+
+        // 改名不受锁影响：来源锁只护内容。
+        store.rename(id, "  教室里的银发少女  ").unwrap();
+        let loaded = store.load(id).unwrap().unwrap();
+        assert_eq!(loaded.title, "教室里的银发少女", "标题应去掉首尾空白");
+        assert_eq!(loaded.positive, "正向", "改名不应动提示词");
+        assert!(loaded.locked, "改名不应解锁");
+        assert_eq!(loaded.prompt_source, PromptSource::Image);
+
+        // 内容仍然改不了。
+        let mut loaded = store.load(id).unwrap().unwrap();
+        loaded.positive = "手改".into();
+        assert!(store.update(&mut loaded).is_err(), "来源锁示例不允许 update");
+
+        // 删除也不受来源锁限制。
+        store.delete(id).unwrap();
+        assert_eq!(store.row_count(), 0);
     }
 
     #[test]

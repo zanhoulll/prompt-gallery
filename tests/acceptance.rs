@@ -1,7 +1,7 @@
-//! 交付验收：从零建库 → 导出 zip → 校验 zip 内容（结构、图片去重、分区标题不入正文）。
+//! 交付验收：从零建库 → 导出 zip → 校验 zip 内容（结构、图片去重、正/负向两段不入标题）。
 //!
-//! 这是端到端的归档契约测试：`data.json` 的字段名、`images/` 条目命名、以及
-//! 「导出正文不含分区标题」这条来自 `CONTEXT.md` 的约束都在这里锁死。
+//! 这是端到端的归档契约测试：`data.json` 的字段名（`positive`/`negative`/`prompt_source`）
+//! 与 `images/` 条目命名都在这里锁死（ADR-0011：0.2.0 起不再有「分区」）。
 
 use std::fs;
 use std::io::Read;
@@ -63,15 +63,14 @@ fn acceptance_export_package_shape() {
     first.title = "教室里的银发少女".into();
     first.image_hash = Some(hash.clone());
     first.image_ext = Some(ext.clone());
-    first.sections.get_mut(0).unwrap().push_str("masterpiece, best quality");
-    first.sections.get_mut(4).unwrap().push_str("classroom, rim light");
+    first.positive = "masterpiece, best quality, classroom, rim light".into();
     store.insert(&mut first).unwrap();
 
     let mut second = Example::draft(0);
     second.title = "复用同一张图".into();
     second.image_hash = Some(hash.clone());
     second.image_ext = Some(ext.clone());
-    second.sections.get_mut(1).unwrap().push_str("1girl, solo");
+    second.positive = "1girl, solo".into();
     store.insert(&mut second).unwrap();
 
     let image_files: Vec<String> = fs::read_dir(store.images_dir())
@@ -110,18 +109,21 @@ fn acceptance_export_package_shape() {
     let mut data = String::new();
     zip.by_name("data.json").unwrap().read_to_string(&mut data).unwrap();
     let json: serde_json::Value = serde_json::from_str(&data).unwrap();
-    assert_eq!(json["archive_version"], 1);
+    assert_eq!(json["archive_version"], 2);
     assert_eq!(json["examples"].as_array().unwrap().len(), 2);
     assert_eq!(json["examples"][0]["title"], "教室里的银发少女");
     assert_eq!(json["examples"][0]["image"], format!("{hash}.{ext}"));
-    assert_eq!(json["examples"][0]["sections"].as_array().unwrap().len(), 5);
-    assert_eq!(json["examples"][0]["sections"][0], "masterpiece, best quality");
-    assert_eq!(json["examples"][0]["sections"][2], "");
+    assert_eq!(
+        json["examples"][0]["positive"],
+        "masterpiece, best quality, classroom, rim light"
+    );
+    assert_eq!(json["examples"][0]["negative"], "");
+    assert_eq!(json["examples"][0]["prompt_source"], "manual");
 
-    // 分区标题绝不能出现在归档正文里。
-    for title in prompt_gallery::model::SECTION_TITLES {
-        assert!(!data.contains(title), "data.json 不应包含分区标题「{title}」");
-    }
+    // 0.2.0 起没有「分区」：旧字段既不该写出，也不该被读回来。
+    assert!(json["examples"][0].get("sections").is_none(), "data.json 不应再有 sections 字段");
+    assert!(!data.contains("sections"), "data.json 不应出现 sections 这个词");
+    assert!(!data.contains("分区"), "data.json 不应出现「分区」字样");
 }
 
 /// 两条示例共用一张图，返回 (store, 目录守卫, 按库内顺序的 id)。

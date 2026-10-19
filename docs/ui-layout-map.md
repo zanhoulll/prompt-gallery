@@ -7,8 +7,8 @@
 
 - **最上**：标题栏——左「▣ Prompt Gallery」+ 数据管理 / 关于 / 外观菜单，右三枚窗口按钮；整条可拖动、双击最大化
 - **中间**：左侧栏（「+新示例」+ 示例列表，宽度可拖）+ 右侧中央区
-- **中央区**：图片框在上，五分区编辑器在下（质量与基础 / 人物特征 / 服装与道具 / 姿态与动作 / 环境与光影）
-- **最下**：底栏——左「保存 另存为 删除 │ 复制提示词」，右状态文案 /「草稿未保存」/ 版本号
+- **中央区**：按图片朝向自适应（ADR-0011 起只有正/负向两个文本框）——横图：图片在上占满整行，下方正向在左、负向在右；竖图：图片在左，右列上正向、下负向
+- **最下**：底栏——左「保存 删除」，右状态文案 /「草稿未保存」/ 版本号
 
 ## 几何锚点（默认 1180×760 下）
 
@@ -18,10 +18,12 @@
 | 标题栏 | 高 40；三枚 46×40 窗口按钮 | `title_bar()` |
 | 侧栏 | 默认 248，可拖 180..420 | `sidebar()` |
 | 示例行 | 高 52、行距 55（`item_spacing.y = 3`）；缩略图 40×40；锁图标占右侧 20 | `paint_sidebar_row()` |
-| 图片框 | 高 = 中央可用高 × 0.42，clamp(140, 420)；与提示词框间距 6 | `image_box()` |
-| 五分区 | 标题 20.4 + 文本框 29.2 + 缝线 1，一节 57.6 | `section_editor()` |
+| 中央区排版 | 常量 `CENTRAL_GAP = 6`、`IMAGE_SHARE = 0.42`、`POSITIVE_SHARE = 0.62`；退化为横版的下限 `MIN_IMAGE_COL_W = 240`、`MIN_TEXT_COL_W = 320` | `central_layout()` |
+| 横版（宽高比 ≥ 1 或无图） | 图片占满整行，高 = 可用高 × 0.42，clamp(140, 420)；余下横带按宽度 62 : 38 左右分成正向 / 负向，两者同高 | `central()`、`image_box()` |
+| 竖版（宽高比 < 1） | 图片列宽 = 可用宽 × 0.42（下限 240）、满高；文本列吃剩余宽（减 6）；文本列内 62 : 38 上下分 | `central()`、`prompt_box()` |
+| 提示词框 | 外框圆角 6、1pt 描边；顶部 6pt：锁字形 12pt + 小标题 11pt；右上角复制按钮 44×18（右 8 / 上 6，文字 12pt：常态 muted、悬停提亮、空文本降低对比）；正文顶内缩 = 6 + 18 + 6 | `prompt_box()` |
 | 底栏 | 高 47.8 | `bottom_bar()` |
-| 弹窗宽 | 320 草稿 / 关窗 · 340 关于 / 删除 · 560 导出 | `dialogs()` |
+| 弹窗宽 | 320 草稿 / 关窗 · 340 关于 / 删除 · 420 覆盖提示词 · 560 导出 | `dialogs()` |
 | 网格 | 纵 12pt / 横 6pt（12pt 汉字 = 2 列 × 1 行）；像素 ÷ 1.25 = pt | — |
 
 ## 改 UI 速查
@@ -32,7 +34,7 @@
 - 尺寸 / 装饰 — `main()`：`with_inner_size`、`min_inner_size`、`with_decorations(false)`、`with_transparent(true)`
 - 外框 — `theme.rs` `window_frame()`：1pt 描边、圆角 10（最大化 0）
 - 主题 — `theme.rs` `apply()`；每帧检测 `ctx.theme()` 变化后重新应用
-- 快捷键 — `handle_shortcuts()`：Ctrl+S / Ctrl+Shift+S / Ctrl+R（锁定示例上 Ctrl+R 无效）
+- 快捷键 — `handle_shortcuts()`：Ctrl+S / Ctrl+R（锁定示例上 Ctrl+R 无效）
 - 八向缩放 — `resize_grips()`：8 个透明 `Area`；坐标取 `ctx.content_rect()`（局部坐标）
 
 ### 标题栏
@@ -47,15 +49,17 @@
 ### 侧栏
 - 固定「+新示例」行 — `new_example_row()`：列表之上、不滚动、点击 = `select(None)`
 - 行标题子矩形 = 「短按进编辑」命中区；锁图标独占右侧 20pt（不选中 / 不编辑 / 不起拖动）
+- 锁字形颜色：普通锁 `text_muted`；来源锁（`prompt_source = image`，ADR-0012）用 `accent`，点击只弹说明、不解锁。来源锁不拦标题内联改名与「删除」按钮（只锁内容），普通锁仍拦
 
 ### 中央区
-- 两框比例 — `central()`：0.42 钳位 140..420；间距 `add_space(6.0)`
+- 排版 — `central()` 先取 `cached_image_aspect()`，再调纯函数 `central_layout(avail, aspect)` 得到三块矩形（有单测）；改比例只动上面那组常量
 - 图片框整框可点选图；「×」只清引用，**不删托管文件**
 - 保存时才入库 — `ingest_pending_image()`：源文件缺失报错、blake3 去重、>256MB 拒绝
-- 分区数量与标题 — `model.rs` 的 `SECTION_COUNT` / `SECTION_TITLES`（只改这两处）
+- 选图即检测 ComfyUI 提示词 — `set_pending_image()` → 需要覆盖时挂 `prompt_confirm` → `commit_image_choice()`（ADR-0013）
+- 提示词框 — `prompt_box(ui, rect, kind)`：`PromptKind::{Positive, Negative}` 决定标题、滚动区盐值与自动保存的焦点 id
 
 ### 底栏
-- `bottom_bar()`：保存 / 另存为 / 删除 │ 复制提示词；右侧状态文案、「草稿未保存」、版本号
+- `bottom_bar()`：保存 / 删除；右侧状态文案、「草稿未保存」、版本号
 - 版本号是纯文本 `Label`，**不要改回 Button**
 - 导出 / 导入 / 打开数据目录不在底栏：标题栏「数据管理」菜单是唯一入口
 

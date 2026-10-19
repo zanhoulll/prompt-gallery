@@ -8,24 +8,25 @@
 
 | 路径 | 作用 | 删了会怎样 |
 | :-- | :-- | :-- |
-| `src\main.rs` | 应用入口 + 全部 UI：侧栏、图片框、五分区编辑器、自绘标题栏、弹窗、原生文件对话框；CJK 字体回退 | 界面全丢，等于重写 |
+| `src\main.rs` | 应用入口 + 全部 UI：侧栏、自适应图片框 + 正/负向提示词框、自绘标题栏、弹窗、原生文件对话框；CJK 字体回退 | 界面全丢，等于重写 |
 | `src\testhook.rs` | 应用内测试钩子（debug-only，`PROMPT_GALLERY_TEST_HOOK` 门控）：注入输入、GPU 回读截图、文件 IPC | `tools/hookdrive.py` 的实机矩阵失效；发布产物不受影响 |
 | `src\theme.rs` | 颜色与控件尺寸的唯一来源（`Palette` 深/浅两套）、spacing、弹窗外壳、按钮样式、`config.json` | 界面退回 egui 默认样式，外观设置也无从读取 |
 | `src\icon_render.rs` | 图标像素：256 设计稿渲染 + `.ico` 打包（纯计算，`build.rs` 复用） | 窗口、标题栏、exe 三处图标一起消失 |
 | `src\icon.rs` | egui 侧包装：纹理缓存 + `paint()` | 编译失败 |
-| `src\lib.rs` | 库 crate 入口，声明 model / store / archive / images | 编译失败 |
-| `src\model.rs` | 领域模型与五分区标题常量（增删分区只改这里） | 分区契约要重写 |
+| `src\lib.rs` | 库 crate 入口，声明 model / store / archive / images / comfy | 编译失败 |
+| `src\model.rs` | 领域模型：`Example`（正向 / 负向提示词、来源、锁）、`PromptSource`、时间戳格式化 | 数据契约要重写 |
+| `src\comfy.rs` | 从 ComfyUI PNG 的 `tEXt/iTXt prompt` 块读节点图，取出正 / 负向提示词（ADR-0013）；不解码像素、不校验 CRC | 新图入库不再自动填提示词，退化为普通图片；PNG 读取器还要重写 |
 | `src\store.rs` | SQLite schema、增删改查、按内容哈希托管图片、数据目录解析 | 已有图库失去唯一的读取实现 |
 | `src\archive.rs` | 导出 / 导入 zip（JSON 元数据 + 图片，id 冲突不覆盖） | 备份与恢复功能丢失 |
 | `src\images.rs` | 解码、等比缩放、缩略图 LRU 与单张预览缓存 | 图片显示不出来 |
 | `src\bin\seed.rs` | 开发用冒烟数据生成器（复用 `Store`） | README 的冒烟步骤失效 |
 | `src\bin\iconasset.rs` | 开发用：`cargo run --bin iconasset` 刷新 `docs\images\icon.png` / `icon.ico` | 文档图标停在旧版 |
 | `build.rs` | 构建脚本（不参与运行）：`icon_render` → `.ico` + VERSIONINFO，经 `rc.exe` 链进 exe | exe 失去图标与版本信息，资源管理器里是默认图标 |
-| `tests\acceptance.rs` | 归档格式契约：`data.json` 字段、`images\` 命名、分区标题不入正文 | 改导出格式时容易静默破坏兼容性 |
+| `tests\acceptance.rs` | 归档格式契约：`data.json` 字段（`positive` / `negative` / `prompt_source`）、`images\` 命名、不再有分区字段 | 改导出格式时容易静默破坏兼容性 |
 | `Cargo.toml` / `Cargo.lock` | 依赖声明 / 精确版本锁定（可重现构建） | 无法构建；或依赖漂移，行为与体积都变 |
 | `AGENTS.md` | 硬规则、文档地图、版本流程（AI 助手的输入） | 约定丢失，后续改动容易偏离既有风格 |
 | `AGENTS-RECIPES.md` | 按症状查的踩坑配方 | 同类坑重踩，验证脚本用法要重新发现 |
-| `CONTEXT.md` | 领域术语表：示例 / 草稿 / 分区 / 锁定 | 代码与文档出现同义词漂移 |
+| `CONTEXT.md` | 领域术语表：示例 / 草稿 / 正负向提示词 / 锁定 / 来源锁 | 代码与文档出现同义词漂移 |
 | `docs\adr\*.md` | 架构决策记录（ADR）：每个重要取舍一份，编号递增 | 「为什么这样选」无从追溯 |
 | `docs\ui-layout-map.md` | UI 布局图：分区结构 + 几何锚点 + 按函数名的代码落点 | 改 UI 时失去对照，得从零重测 |
 | `docs\images\*` | 文档用图标（`icon.png` / `icon.ico`），**不是运行时资源** | `cargo run --bin iconasset` 重新生成 |

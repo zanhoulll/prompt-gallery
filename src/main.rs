@@ -1,11 +1,11 @@
 //! Prompt Gallery —— 本地提示词图库。
 //!
 //! 需求与决策来源：
-//! * `CONTEXT.md`：术语表；窗口标题、导出文件名前缀、五个分区标题等用户可见文案。
+//! * `CONTEXT.md`：术语表；窗口标题、导出文件名前缀等用户可见文案。
 //! * `docs/adr/0001-egui-eframe-for-low-memory-ui.md`：egui/eframe，隐藏滚动条、
 //!   长按拖拽重排、不可选中灰字都要自己画。
-//! * `docs/adr/0002-prompt-editor-visual-continuity-not-single-document.md`：提示词编辑器
-//!   由 5 个 TextEdit 在同一滚动容器里无缝拼接，视觉上是一个框。
+//! * `docs/adr/0011-prompt-flattened-to-positive-and-negative.md`：正/负向提示词各一个
+//!   独立文本框，不再分区。
 //! * `docs/adr/0003-sqlite-metadata-plus-hash-named-image-files.md`：SQLite + 内容哈希图片文件。
 //!
 //! 依赖版本注记：本项目使用 egui/eframe 0.36。该版本的 `eframe::App` 用 `ui(&mut Ui, &mut Frame)`
@@ -25,10 +25,9 @@ use egui::{
 };
 
 use prompt_gallery::archive;
+use prompt_gallery::comfy::{self, Detection};
 use prompt_gallery::images::{fit_size, ImageCache};
-use prompt_gallery::model::{
-    now_unix, Example, Sections, SectionIndex, SECTION_COUNT, SECTION_TITLES,
-};
+use prompt_gallery::model::{now_unix, Example, PromptSource};
 use prompt_gallery::store::{self, Store};
 
 mod icon;
@@ -69,6 +68,22 @@ const DRAG_SOURCE_OPACITY: f32 = 0.35;
 const DRAG_GHOST_OPACITY: f32 = 0.85;
 /// 状态文案自动淡出的秒数。
 const STATUS_TTL: f64 = 12.0;
+
+/// 中央区两块之间的缝宽（pt）。
+const CENTRAL_GAP: f32 = 6.0;
+/// 图片框在长边方向的占比：横版取可用高、竖版取可用宽（同一常数，观感一致）。
+const IMAGE_SHARE: f32 = 0.42;
+/// 竖版文本列内正向提示词占比，其余给负向。
+const POSITIVE_SHARE: f32 = 0.62;
+/// 竖版安全网：图片列最小宽（pt）。
+const MIN_IMAGE_COL_W: f32 = 240.0;
+/// 竖版安全网：文本列最小宽（pt），不足则退回横版。
+const MIN_TEXT_COL_W: f32 = 320.0;
+/// 文本框右上角复制按钮的尺寸与内边距（pt）。
+const COPY_BTN_W: f32 = 44.0;
+const COPY_BTN_H: f32 = 18.0;
+/// 复制按钮反馈文案的停留时长（秒）。
+const COPY_FLASH: f64 = 0.8;
 
 /// 支持的图片后缀（对话框过滤用）。
 const IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"];
@@ -181,6 +196,10 @@ struct GalleryView {
     close_confirm: bool,
     /// 用户已在关窗确认里选择放弃草稿，允许真正关闭。
     close_confirmed: bool,
+    /// 待确认的「图片内提示词会清空现有文本」选择；字节已读入内存，确认前后看到的是同一张图。
+    prompt_confirm: Option<PendingChoice>,
+    /// 复制按钮的反馈：哪一侧、何时消隐（`副本已复制` 文案只停 0.8s）。
+    copy_flash: Option<(PromptKind, f64)>,
     /// 应用内测试钩子（ADR-0008）：仅当环境变量启用且是 debug 构建时为 Some。
     hook: Option<testhook::TestHook>,
 }
@@ -210,6 +229,8 @@ impl GalleryView {
             autosave_deadline: None,
             close_confirm: false,
             close_confirmed: false,
+            prompt_confirm: None,
+            copy_flash: None,
             hook: testhook::TestHook::from_env(),
         };
         // 启动后自动选中第一条；空图库则直接给一个草稿，省掉一次点击。
@@ -222,6 +243,16 @@ impl GalleryView {
 
     fn current_id(&self) -> Option<i64> {
         self.current.as_ref().and_then(|example| example.id)
+    }
+
+    /// 当前示例是否被「来源锁」锁住（提示词由程序从图片读出，解不开，ADR-0012）。
+    ///
+    /// 来源锁只锁内容（提示词两段、图片与锁本身），不锁标题与删除：
+    /// 否则 ComfyUI 示例一落库就既改不了名、也删不掉。
+    fn current_source_locked(&self) -> bool {
+        self.current
+            .as_ref()
+            .map_or(false, |example| example.prompt_source.is_locked_source())
     }
 
     /// 是否有未保存改动。
@@ -393,22 +424,6 @@ impl GalleryView {
         }
     }
 
-    /// 另存为：当前示例成为新草稿，下次保存时落库为新示例（原示例不变）。
-    fn save_as(&mut self) {
-        let position = self.store.next_position();
-        let Some(current) = self.current.as_mut() else {
-            return;
-        };
-        current.id = None;
-        current.position = position;
-        current.created_at = now_unix();
-        current.updated_at = current.created_at;
-        self.baseline = None;
-        self.editing_title = None;
-        self.status = "已另存为副本，点「保存」写入图库".to_string();
-        self.status_time = f64::NAN;
-    }
-
     fn delete_current(&mut self) {
         let Some(id) = self.current_id() else {
             return;
@@ -441,10 +456,16 @@ impl GalleryView {
         }
     }
 
-    /// 选图/拖图：只记住源文件路径，不再当场写入托管目录（ADR-0004）。
+    /// 选图/拖图：读一次源文件做校验，检测 ComfyUI 提示词，再决定是否直接换图。
     ///
-    /// 这里只读一次源文件做格式/大小校验与尺寸提示；真正的入库发生在保存时。
+    /// ADR-0004：草稿仍只记源路径，保存时才按内容哈希入库；已落库示例选图即刻入库（ADR-0006 D3）。
+    /// ADR-0013：图片自带提示词且当前已有文本时，先挂起确认（图片也先不换，确认前后一致），
+    /// 确认后才「清空两段 → 写入 → 上来源锁」一次性完成。
     fn set_pending_image(&mut self, ctx: &egui::Context, path: &Path) {
+        if self.current.as_ref().map_or(false, |e| e.locked) {
+            self.set_status(ctx, "示例已锁定，无法更换图片".to_string());
+            return;
+        }
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -454,7 +475,7 @@ impl GalleryView {
                 return;
             }
         };
-        let Some(detected) = store::ext_for_bytes(&bytes) else {
+        let Some(ext) = store::ext_for_bytes(&bytes) else {
             self.set_status(ctx, format!("无法识别的图片格式：{}", path.display()));
             return;
         };
@@ -465,49 +486,104 @@ impl GalleryView {
             );
             return;
         }
+        let label = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
         let size = image_size_of(&bytes);
+        let detection = comfy::detect(&bytes);
+        let choice = PendingChoice {
+            path: path.to_path_buf(),
+            label,
+            key: format!("pending:{}", path.display()),
+            bytes,
+            ext,
+            size,
+            detection,
+        };
+        let has_text = self.current.as_ref().map_or(false, |e| !e.prompts_empty());
+        if has_text && matches!(choice.detection, Detection::Found { .. }) {
+            self.prompt_confirm = Some(choice);
+            self.set_status(ctx, "检测到 ComfyUI 提示词：确认后会清空当前文本".to_string());
+            return;
+        }
+        self.commit_image_choice(ctx, choice);
+    }
 
-        if self.current_id().is_some() {
-            // 已落库示例：选图即刻入库并写库——它没有「保存时刻」可等（ADR-0006 D3）。
-            if self.current.as_ref().map(|e| e.locked).unwrap_or(false) {
-                self.set_status(ctx, "示例已锁定，无法更换图片".to_string());
-                return;
-            }
-            match self.store.store_image_bytes(&bytes, detected) {
-                Ok((hash, ext)) => {
+    /// 把一次选图结果落进当前示例：换图，必要时写入图片提示词并上来源锁。
+    fn commit_image_choice(&mut self, ctx: &egui::Context, choice: PendingChoice) {
+        let size_hint = match choice.size {
+            Some((w, h)) => format!(" {w}×{h}"),
+            None => String::new(),
+        };
+        let extracted = match &choice.detection {
+            Detection::Found { positive, negative } => Some((positive.clone(), negative.clone())),
+            _ => None,
+        };
+        let pending = self.current.as_ref().map_or(true, |e| e.is_draft());
+
+        if let Some(id) = self.current_id() {
+            let (hash, ext) = match self.store.store_image_bytes(&choice.bytes, choice.ext) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    self.set_error(err);
+                    return;
+                }
+            };
+            match extracted {
+                // 有图片内提示词：换图 + 清空并写入两段 + 上来源锁，一条 UPDATE 原子完成（ADR-0012）。
+                Some((positive, negative)) => {
+                    if let Err(err) = self.store.apply_image_prompt(id, &hash, &ext, &positive, &negative)
+                    {
+                        self.set_error(err);
+                        return;
+                    }
+                    self.cache.drop_preview();
+                    self.load_example(id);
+                    self.set_status(
+                        ctx,
+                        format!("已从 ComfyUI 图片读取提示词，已锁定{size_hint}"),
+                    );
+                }
+                None => {
                     if let Some(example) = self.current.as_mut() {
                         example.image_hash = Some(hash);
                         example.image_ext = Some(ext);
                     }
                     self.cache.drop_preview();
                     self.flush_now();
-                    let hint = match size {
-                        Some((w, h)) => format!("已选择图片 {w}×{h}"),
-                        None => "已选择图片".to_string(),
-                    };
-                    self.set_status(ctx, hint);
+                    self.set_status(ctx, selection_status(&choice.detection, &size_hint, false));
                 }
-                Err(err) => self.set_error(err),
             }
             return;
         }
 
         // 草稿：仍然只记源路径，保存时才入库（ADR-0004）。
-        let label = path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.display().to_string());
-        let hint = match size {
-            Some((w, h)) => format!("已选择图片 {w}×{h}（保存后入库）"),
-            None => "已选择图片（保存后入库）".to_string(),
-        };
         self.pending_image = Some(PendingImage {
-            path: path.to_path_buf(),
-            label,
-            key: format!("pending:{}", path.display()),
+            path: choice.path,
+            label: choice.label,
+            key: choice.key,
         });
         self.cache.drop_preview();
-        self.set_status(ctx, hint);
+        match extracted {
+            // 草稿期也立刻上锁（ADR-0012）：否则保存后这条文本的来源就说不清了。
+            Some((positive, negative)) => {
+                if let Some(example) = self.current.as_mut() {
+                    example.positive = positive;
+                    example.negative = negative;
+                    example.prompt_source = PromptSource::Image;
+                    example.locked = true;
+                }
+                self.set_status(
+                    ctx,
+                    format!("已从 ComfyUI 图片读取提示词，已锁定{size_hint}（保存后入库）"),
+                );
+            }
+            None => self.set_status(
+                ctx,
+                selection_status(&choice.detection, &size_hint, pending),
+            ),
+        }
     }
 
     fn export_to(&mut self, ctx: &egui::Context) {
@@ -556,7 +632,7 @@ fn image_size_of(bytes: &[u8]) -> Option<(u32, u32)> {
 /// 待入库图片到托管文件：读取源路径，按内容哈希写入 images/，返回 (hash, ext)。
 ///
 /// 边界（ADR-0004）：源文件在保存前被移动/删除则返回错误，让保存失败并提示重新选择，
-/// 而不是静默丢图；内容哈希命名让重复图片复用同一个文件（另存为时不重复写）。
+/// 而不是静默丢图；内容哈希命名让同一张图在多次入库/多条示例间复用同一个文件。
 fn ingest_pending_image(store: &Store, pending: &PendingImage) -> anyhow::Result<(String, String)> {
     let bytes = std::fs::read(&pending.path).map_err(|err| {
         anyhow::Error::new(err).context(format!(
@@ -571,6 +647,43 @@ fn ingest_pending_image(store: &Store, pending: &PendingImage) -> anyhow::Result
         anyhow::bail!("图片过大（{} MB），已拒绝载入", bytes.len() / 1024 / 1024);
     }
     store.store_image_bytes(&bytes, ext)
+}
+
+/// 确认弹窗里的提示词预览：取前 `limit` 个字符，超出补省略号。
+fn preview_excerpt(text: &str, limit: usize) -> String {
+    let mut excerpt: String = text.chars().take(limit).collect();
+    if text.chars().count() > limit {
+        excerpt.push('…');
+    }
+    excerpt
+}
+
+/// 应用测试钩子递进来的「选了一张图」（ADR-0008）：与拖拽 / 点击选图同一条路径。
+///
+/// 写成自由函数而不是方法：钩子只在 debug 构建里有真实现，这里保持与 `set_pending_image`
+/// 同一条路径即可，不需要为它动 `impl GalleryView` 的结构。
+fn pump_hook_image(view: &mut GalleryView, ctx: &egui::Context) {
+    let Some(path) = view
+        .hook
+        .as_mut()
+        .and_then(|hook| hook.take_image_request())
+        .map(|(_seq, path)| path)
+    else {
+        return;
+    };
+    view.set_pending_image(ctx, std::path::Path::new(&path));
+    if let Some(hook) = view.hook.as_mut() {
+        hook.finish_image_request(Ok(String::new()));
+    }
+}
+
+/// 选图后的状态文案（ADR-0013 的三态）；`pending` 为真时补「保存后入库」。
+fn selection_status(detection: &Detection, size_hint: &str, pending: bool) -> String {
+    let suffix = if pending { "（保存后入库）" } else { "" };
+    match detection {
+        Detection::NoPositive => format!("检测到 ComfyUI 图片，但未找到提示词{suffix}"),
+        _ => format!("已选择图片{size_hint}{suffix}"),
+    }
 }
 
 // ---------------------------------------------------------------- 界面
@@ -605,6 +718,8 @@ impl eframe::App for GalleryView {
             let path = file.path().to_path_buf();
             self.set_pending_image(&ctx, &path);
         }
+        // 测试钩子的「选图」指令走同一条路径（原生文件对话框没法被合成输入驱动）。
+        pump_hook_image(self, &ctx);
 
         // 自动保存到点：把已落库示例的改动写库（ADR-0006）。
         if let Some(deadline) = self.autosave_deadline {
@@ -648,6 +763,8 @@ impl eframe::App for GalleryView {
             || self.about_open
             || self.row_drag.is_some()
             || self.close_confirm
+            || self.prompt_confirm.is_some()
+            || self.copy_flash.is_some()
         {
             ctx.request_repaint();
         }
@@ -780,7 +897,6 @@ impl GalleryView {
     fn run_action(&mut self, ctx: &egui::Context, action: Action) {
         match action {
             Action::Save => self.save_current(),
-            Action::SaveAs => self.save_as(),
             Action::Delete => self.delete_confirm = true,
             Action::Export => {
                 self.export_path = Path::new(&self.data_dir)
@@ -903,23 +1019,20 @@ impl GalleryView {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (save, save_as, rename) = ctx.input_mut(|i| {
+        let (save, rename) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::CTRL, Key::S),
-                i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::S),
                 i.consume_key(Modifiers::CTRL, Key::R),
             )
         });
-        if save_as {
-            self.save_as();
-        } else if save {
+        if save {
             self.save_current();
         }
         if rename {
             // §2：Ctrl+R 改为当前行的侧边栏内联编辑，不再弹重命名窗。
-            // 锁定示例禁止改名（ADR-0007）。
+            // 手动锁定示例禁止改名（ADR-0007）；来源锁不限制改名（ADR-0012）。
             let locked = self.current.as_ref().map(|e| e.locked).unwrap_or(false);
-            if !locked {
+            if !locked || self.current_source_locked() {
                 let target = self.current_id();
                 self.begin_inline_edit(target);
             }
@@ -993,6 +1106,7 @@ impl GalleryView {
                         title: example.display_title().to_string(),
                         thumb,
                         locked: false,
+                        source_locked: false,
                     });
                 }
                 for row in self.store.rows() {
@@ -1001,6 +1115,7 @@ impl GalleryView {
                         title: row.display_title().to_string(),
                         thumb: row.image_file_name().map(ThumbSource::Managed),
                         locked: row.locked,
+                        source_locked: row.prompt_source.is_locked_source(),
                     });
                 }
 
@@ -1010,6 +1125,8 @@ impl GalleryView {
                 let mut insert_at: Option<(i64, usize)> = None;
                 // 点击锁图标的结果，待列表渲染完后再写库（ADR-0007）。
                 let mut lock_toggle: Option<(i64, bool)> = None;
+                // 来源锁点了也不改状态：沿用 ADR-0012，只提示一句。
+                let mut unlock_blocked = false;
                 // 收集每一行的矩形：落点要相对所有行判断（草稿行不参与重排，不进 row_rects）。
                 let mut row_rects: Vec<Rect> = Vec::with_capacity(rows.len());
                 // 本帧指针物理按下所在的行：长按手势的起点（§1，ADR-0005）。
@@ -1051,6 +1168,7 @@ impl GalleryView {
                         for row in rows.iter() {
                             let is_draft = row.id.is_none();
                             let locked = row.locked;
+                            let source_locked = row.source_locked;
                             let selected = row.id == current_id;
                             let width = (ui.available_width() - 8.0).max(60.0);
                             // 只声明 click 语义：长按手势由本文件自建状态机驱动，
@@ -1093,17 +1211,33 @@ impl GalleryView {
                                     Sense::click(),
                                 );
                                 if lock_response.clicked() {
-                                    lock_toggle =
-                                        Some((row.id.expect("非草稿行必有 id"), !locked));
+                                    if source_locked {
+                                        unlock_blocked = true;
+                                    } else {
+                                        lock_toggle =
+                                            Some((row.id.expect("非草稿行必有 id"), !locked));
+                                    }
                                 }
                                 if lock_response.hovered() {
                                     ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                                 }
+                                lock_response.on_hover_text(if source_locked {
+                                    "提示词来自图片，无法解锁"
+                                } else if locked {
+                                    "点击解锁"
+                                } else {
+                                    "点击上锁"
+                                });
                             }
 
                             if is_draft {
+                                // 草稿行本来就是当前示例：点标题进改名，点别处什么都不做。
+                                // 原来这里无条件 select(None)，非空草稿会被判成「切换示例」，
+                                // 于是点一下自己就弹「草稿尚未保存」。
                                 if response.clicked() && !editing_this {
-                                    clicked = Some(row.id);
+                                    if selected && pointer_on_title && self.row_drag.is_none() {
+                                        edit_start = Some(row.id);
+                                    }
                                 }
                             } else {
                                 let row_id = row.id.expect("非草稿行必有 id");
@@ -1167,6 +1301,7 @@ impl GalleryView {
                                 } else {
                                     None
                                 },
+                                source_locked,
                                 if ghosting_this {
                                     DRAG_SOURCE_OPACITY
                                 } else {
@@ -1333,8 +1468,13 @@ impl GalleryView {
                                 .iter()
                                 .find(|row| row.id == Some(row_id))
                                 .map_or(false, |row| row.locked);
-                            // 锁定示例只能选中查看，不进内联编辑（ADR-0007）。
-                            if !locked && Some(row_id) == current_id && on_title {
+                            // 手动锁定示例只能选中查看，不进内联编辑（ADR-0007）；
+                            // 来源锁不拦改名（ADR-0012）。
+                            let source_locked = rows
+                                .iter()
+                                .find(|row| row.id == Some(row_id))
+                                .map_or(false, |row| row.source_locked);
+                            if (!locked || source_locked) && Some(row_id) == current_id && on_title {
                                 self.begin_inline_edit(Some(row_id));
                             } else {
                                 self.select(Some(row_id));
@@ -1391,6 +1531,9 @@ impl GalleryView {
                         None => {}
                     }
                 }
+                if unlock_blocked {
+                    self.set_status(&ctx, "提示词来自图片，无法解锁".to_string());
+                }
 
                 // 拖动虚影与源行淡占位（§2）：Foreground 图层整行副本 + 投影。
                 self.paint_drag_ghost(ui, &rows, source_rect, &images_dir);
@@ -1425,7 +1568,13 @@ impl GalleryView {
             Some(id) => match self.store.load(id) {
                 Ok(Some(mut stored)) => {
                     stored.title = title.clone();
-                    match self.store.update(&mut stored) {
+                    // 来源锁示例的 update() 会被锁校验挡下，改名走单独的写口（ADR-0012）。
+                    let result = if stored.prompt_source.is_locked_source() {
+                        self.store.rename(id, &title)
+                    } else {
+                        self.store.update(&mut stored)
+                    };
+                    match result {
                         Ok(()) => {
                             // 只同步标题，保留其它未保存的编辑。
                             if let Some(current) = self.current.as_mut() {
@@ -1516,6 +1665,7 @@ impl GalleryView {
                 false,
                 false,
                 None,
+                row.source_locked,
                 DRAG_SOURCE_OPACITY,
                 false,
             );
@@ -1543,6 +1693,7 @@ impl GalleryView {
                     false,
                     false,
                     None,
+                    row.source_locked,
                     DRAG_GHOST_OPACITY,
                     true,
                 );
@@ -1586,19 +1737,13 @@ impl GalleryView {
                 {
                     actions.push(Action::Save);
                 }
-                if ui
-                    .add_enabled(self.current.is_some(), egui::Button::new("另存为"))
-                    .on_hover_text("复制成一条新示例，原示例保持不变（Ctrl+Shift+S）")
-                    .clicked()
-                {
-                    actions.push(Action::SaveAs);
-                }
+                let source_locked = self.current_source_locked();
                 if ui
                     .add_enabled(
-                        self.current_id().is_some() && !locked,
+                        self.current_id().is_some() && (!locked || source_locked),
                         egui::Button::new("删除"),
                     )
-                    .on_hover_text(if locked {
+                    .on_hover_text(if locked && !source_locked {
                         "该示例已锁定，无法删除"
                     } else {
                         "删除当前示例（托管图片文件保留）"
@@ -1606,23 +1751,6 @@ impl GalleryView {
                     .clicked()
                 {
                     actions.push(Action::Delete);
-                }
-
-                ui.separator();
-                // 复制提示词沿用禁用逻辑——五个分区正文全空时置灰。
-                let clipboard_text = self
-                    .current
-                    .as_ref()
-                    .map(|example| example.sections.join_for_clipboard())
-                    .unwrap_or_default();
-                let can_copy = !clipboard_text.is_empty();
-                if ui
-                    .add_enabled(can_copy, egui::Button::new("复制提示词"))
-                    .on_hover_text("只复制五个分区的正文，不含分区标题")
-                    .clicked()
-                {
-                    ui.ctx().copy_text(clipboard_text);
-                    self.set_status(ui.ctx(), "正向提示词已复制到剪贴板".to_string());
                 }
 
                 ui.separator();
@@ -1686,23 +1814,43 @@ impl GalleryView {
         self.status.clone()
     }
 
+    /// 中央区：图片框 + 正/负向提示词框，按图片朝向自适应排布。
+    ///
+    /// 宽图（含正方形、无图）走横版：上图片、下分左右两段提示词；
+    /// 高图走竖版：左图片、右上正向、右下负向。目标是尽量露出图片的长边。
     fn central(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            let total_height = ui.available_height();
-            let image_height = (total_height * 0.42).clamp(140.0, 420.0);
-
-            // 图片框
-            self.image_box(ui, image_height);
-            ui.add_space(6.0);
-            // 提示词框：5 个 TextEdit 共用一个滚动条，视觉上是一个框（ADR-0002）
-            self.prompt_editor(ui);
+            let avail = ui.available_rect_before_wrap();
+            let aspect = self.cached_image_aspect(ui.ctx());
+            let layout = central_layout(avail, aspect);
+            self.image_box(ui, layout.image);
+            self.prompt_box(ui, layout.positive, PromptKind::Positive);
+            self.prompt_box(ui, layout.negative, PromptKind::Negative);
+            // 三块都是按显式矩形绘制的：这里补一次分配，让面板认为自己已用完空间。
+            let _ = ui.allocate_space(avail.size());
         });
     }
 
-    fn image_box(&mut self, ui: &mut egui::Ui, height: f32) {
+    /// 当前图片的宽高比：优先待入库图，其次已入库图；都没有则 `None`（走横版）。
+    ///
+    /// 纹理已经缓存，重复调用只是在查缓存；首次调用顺带解码一次预览。
+    fn cached_image_aspect(&mut self, ctx: &egui::Context) -> Option<f32> {
+        if let Some(pending) = self.pending_image.as_ref() {
+            let key = pending.key.clone();
+            let path = pending.path.clone();
+            return self.cache.preview(ctx, &key, &path).ok().map(|c| c.aspect());
+        }
+        let file_name = self.current.as_ref().and_then(|e| e.image_file_name())?;
+        let path = self.store.images_dir().join(&file_name);
+        self.cache
+            .preview(ctx, &file_name, &path)
+            .ok()
+            .map(|c| c.aspect())
+    }
+
+    fn image_box(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let p = theme::Palette::current(ui.ctx());
-        let width = ui.available_width();
-        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+        let response = ui.interact(rect, Id::new("image_box"), Sense::click());
         // 锁定示例：图片框不响应点击、不接受拖入（ADR-0007）。
         let locked = self
             .current
@@ -1881,54 +2029,158 @@ impl GalleryView {
         }
     }
 
-    /// 提示词编辑器：5 个无缝拼接的 TextEdit（ADR-0002）。
+    /// 一个提示词文本框：外框 + 左上角小标题/锁标记 + 右上角复制按钮 + 可滚动正文。
     ///
-    /// 分区标题是独立的灰字 `Label`（`selectable(false)`），不是文本框内容的一部分，
-    /// 因此天然不可编辑、不可选中，也不会随复制进入剪贴板。
-    fn prompt_editor(&mut self, ui: &mut egui::Ui) {
+    /// 正/负向同权（ADR-0011）：各自独立复制、独立自动保存，锁定时一起只读。
+    fn prompt_box(&mut self, ui: &mut egui::Ui, rect: Rect, kind: PromptKind) {
         let p = theme::Palette::current(ui.ctx());
-        let Some(example) = self.current.as_mut() else {
-            ui.label(RichText::new("没有选中的示例").color(p.text_muted));
+        let ctx = ui.ctx().clone();
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(6),
+            p.surface_sunken,
+            Stroke::new(1.0, p.border),
+            StrokeKind::Inside,
+        );
+
+        let Some(example) = self.current.as_ref() else {
             return;
         };
         let locked = example.locked;
+        let source_locked = example.prompt_source.is_locked_source();
+        let copy_text = match kind {
+            PromptKind::Positive => example.positive.trim().to_string(),
+            PromptKind::Negative => example.negative.trim().to_string(),
+        };
         let is_stored = !example.is_draft();
-        let ctx = ui.ctx().clone();
+
+        // 顶部一条：左侧小标题（锁定时常显 🔒，来源锁用强调色），右侧复制按钮。
+        let head_top = rect.top() + 6.0;
+        let head_center = head_top + COPY_BTN_H * 0.5;
+        let mut title_left = rect.left() + 8.0;
+        if locked {
+            ui.painter().text(
+                egui::pos2(title_left, head_center),
+                Align2::LEFT_CENTER,
+                "🔒",
+                FontId::proportional(12.0),
+                if source_locked { p.accent } else { p.text_muted },
+            );
+            title_left += 16.0;
+        }
+        ui.painter().text(
+            egui::pos2(title_left, head_center),
+            Align2::LEFT_CENTER,
+            kind.title(),
+            FontId::proportional(11.0),
+            p.text_muted,
+        );
+
+        // 复制按钮：自绘命中区，宽度固定为「已复制」以避开反馈时的抖动。
+        let copy_rect = Rect::from_min_size(
+            egui::pos2(rect.right() - 8.0 - COPY_BTN_W, head_top),
+            Vec2::new(COPY_BTN_W, COPY_BTN_H),
+        );
+        let now = ctx.input(|i| i.time);
+        let flashing = self
+            .copy_flash
+            .map_or(false, |(flashed, until)| flashed == kind && now < until);
+        let can_copy = !copy_text.is_empty();
+        let copy_response = ui.interact(
+            copy_rect,
+            Id::new(("copy_prompt", kind.key())),
+            Sense::click(),
+        );
+        let copy_hovered = can_copy && copy_response.hovered();
+        if copy_hovered {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            ui.painter()
+                .rect_filled(copy_rect, CornerRadius::same(4), p.row_hover);
+        }
+        // 三态：空文本降低对比（向背景靠拢，深浅两个主题都看不出可点）、常态 muted、悬停提亮。
+        let copy_color = if !can_copy {
+            p.text_muted.gamma_multiply(0.55)
+        } else if flashing {
+            p.accent
+        } else if copy_hovered {
+            p.text
+        } else {
+            p.text_muted
+        };
+        ui.painter().text(
+            copy_rect.center(),
+            Align2::CENTER_CENTER,
+            if flashing { "已复制" } else { "复制" },
+            FontId::proportional(12.0),
+            copy_color,
+        );
+        if can_copy {
+            if copy_response.on_hover_text("复制这一侧的提示词").clicked() {
+                ctx.copy_text(copy_text);
+                self.copy_flash = Some((kind, now + COPY_FLASH));
+                ctx.request_repaint_after(Duration::from_secs_f64(COPY_FLASH));
+                self.set_status(&ctx, format!("{}已复制到剪贴板", kind.title()));
+            }
+        }
+
+        // 正文：从按钮下方开始，自己滚动；「一个框」的观感由外框保证。
+        let text_rect = Rect::from_min_max(
+            egui::pos2(rect.left() + 8.0, head_top + COPY_BTN_H + 6.0),
+            egui::pos2(rect.right() - 8.0, rect.bottom() - 8.0),
+        );
+        if text_rect.width() < 16.0 || text_rect.height() < 16.0 {
+            return;
+        }
+        let edit_id = Id::new(("prompt_edit", kind.key()));
         let mut changed = false;
+        if let Some(example) = self.current.as_mut() {
+            let text = match kind {
+                PromptKind::Positive => &mut example.positive,
+                PromptKind::Negative => &mut example.negative,
+            };
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(text_rect)
+                    .layout(Layout::top_down(Align::Min))
+                    .id_salt(("prompt_box", kind.key())),
+                |ui| {
+                    ui.set_clip_rect(text_rect);
+                    ScrollArea::vertical()
+                        .id_salt(("prompt_scroll", kind.key()))
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            changed |= ui
+                                .add_enabled(
+                                    !locked,
+                                    TextEdit::multiline(text)
+                                        .id(edit_id)
+                                        .desired_width(ui.available_width())
+                                        .desired_rows(6)
+                                        .frame(Frame::NONE)
+                                        .hint_text(if kind == PromptKind::Negative {
+                                            "（可留空）"
+                                        } else {
+                                            "（留空）"
+                                        }),
+                                )
+                                .changed();
+                        });
+                },
+            );
+        }
 
-        Frame::new()
-            .fill(p.surface_sunken)
-            .stroke(Stroke::new(1.0, p.border))
-            .corner_radius(CornerRadius::same(6))
-            .inner_margin(egui::Margin::symmetric(8, 6))
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ScrollArea::vertical()
-                    .id_salt("prompt_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        // 铺满编辑区宽度，让五个分区看起来是一个框的内部分栏。
-                        ui.set_min_width(ui.available_width());
-                        for index in 0..SECTION_COUNT {
-                            changed |= section_editor(ui, &mut example.sections, index, locked);
-                        }
-                        ui.add_space(4.0);
-                    });
-            });
-
-        // 已落库示例：输入停止 500ms 后自动写库（ADR-0006）。
+        // 已落库示例：输入停止 500ms 后自动写库；失焦即落库（ADR-0006）。
         // egui 是反应式的：不请求一次将来的重绘，到点那一帧永远不会到来。
         if is_stored && !locked {
             if changed {
-                let now = ctx.input(|i| i.time);
                 self.autosave_deadline = Some(now + AUTOSAVE_DEBOUNCE.as_secs_f64());
                 ctx.request_repaint_after(AUTOSAVE_DEBOUNCE);
             } else {
-                // 失焦即落库（ADR-0006）：焦点离开五分区且仍有未写改动时立刻 flush。
-                let section_focused = ui.memory(|memory| memory.focused()).map_or(false, |id| {
-                    (0..SECTION_COUNT).any(|index| id == Id::new(("section_edit", index)))
-                });
-                if !section_focused && self.dirty() {
+                let focused = ui
+                    .memory(|memory| memory.focused())
+                    .map_or(false, |id| id == edit_id);
+                if !focused && self.dirty() {
                     self.flush_now();
                 }
             }
@@ -2064,6 +2316,46 @@ impl GalleryView {
             }
             if close || escape {
                 self.delete_confirm = false;
+            }
+        }
+
+        // 图片内提示词覆盖确认（ADR-0013）：确认前图片与文本都不动，取消即完全回退。
+        if self.prompt_confirm.is_some() {
+            let preview = self
+                .prompt_confirm
+                .as_ref()
+                .and_then(|choice| match &choice.detection {
+                    Detection::Found { positive, .. } => Some(preview_excerpt(positive, 80)),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let mut confirm = false;
+            let mut cancel = false;
+            theme::modal_shell(ctx, "prompt_confirm_modal", 420.0, |ui| {
+                theme::modal_title(ui, "覆盖提示词？");
+                theme::modal_desc(ui, "确定清空文本框，操作不可逆");
+                ui.add_space(10.0);
+                ui.add(
+                    egui::Label::new(RichText::new(preview).size(12.0).color(p.text_muted))
+                        .wrap(),
+                );
+                ui.add_space(18.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::danger_button(ui, "确定").clicked() {
+                        confirm = true;
+                    }
+                    if theme::secondary_button(ui, "取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if confirm {
+                if let Some(choice) = self.prompt_confirm.take() {
+                    self.commit_image_choice(ctx, choice);
+                }
+            } else if cancel || escape {
+                self.prompt_confirm = None;
+                self.set_status(ctx, "已取消：图片与文本都没有改动".to_string());
             }
         }
 
@@ -2240,7 +2532,6 @@ impl GalleryView {
 #[derive(Clone, Copy)]
 enum Action {
     Save,
-    SaveAs,
     Delete,
     Export,
     Import,
@@ -2249,73 +2540,114 @@ enum Action {
 
 // ---------------------------------------------------------------- 自定义控件
 
-/// 分区编辑器：一个灰色不可选中的标题 + 一个无边框 TextEdit。
-///
-/// 返回该分区文本框本帧是否被改动（ADR-0006 的自动保存输入）。
-/// `locked` 为真时文本框置灰且不可交互。
-fn section_editor(
-    ui: &mut egui::Ui,
-    sections: &mut Sections,
-    index: SectionIndex,
-    locked: bool,
-) -> bool {
-    let p = theme::Palette::current(ui.ctx());
-    ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        // 标题：灰色、左对齐、不可修改、不可选中。
-        //
-        // 用 painter 直接排版而不是 `Label`：行高留出富余并垂直居中，
-        // 灰色标题与下面的文本框之间也因此有稳定的间距。
-        let font = egui::FontId::proportional(12.0);
-        let row_height = ui.ctx().fonts_mut(|fonts| fonts.row_height(&font));
-        let galley =
-            ui.painter()
-                .layout_no_wrap(SECTION_TITLES[index].to_string(), font, p.text_muted);
-        let head_height = row_height.max(galley.size().y) + 6.0;
-        let (head_rect, _) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), head_height),
-            Sense::hover(),
-        );
-        let text_pos = egui::pos2(
-            head_rect.left(),
-            head_rect.center().y - galley.size().y * 0.5,
-        );
-        ui.painter().galley(text_pos, galley, p.text_muted);
+/// 提示词框的两侧（ADR-0011）：正向与负向同权，各自独立复制、独立自动保存。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptKind {
+    Positive,
+    Negative,
+}
 
-        let width = ui.available_width();
-        let text = sections
-            .get_mut(index)
-            .expect("分区下标由 SECTION_COUNT 约束");
-        let changed = ui.add_enabled(
-            !locked,
-            TextEdit::multiline(text)
-                .id(Id::new(("section_edit", index)))
-                .desired_width(width)
-                .desired_rows(2)
-                .frame(Frame::NONE)
-                .hint_text("（留空）"),
-        )
-        .changed();
-
-        // 分区之间的细分隔线：让五个文本框看起来是一个框的内部分栏，
-        // 而不是五个独立控件（ADR-0002）。
-        if index + 1 < SECTION_COUNT {
-            ui.add_space(3.0);
-            let (line_rect, _) =
-                ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
-            ui.painter().hline(
-                line_rect.x_range(),
-                line_rect.center().y,
-                Stroke::new(1.0, p.border),
-            );
-            ui.add_space(4.0);
+impl PromptKind {
+    /// 用作控件 id 后缀与滚动区盐值。
+    fn key(self) -> &'static str {
+        match self {
+            Self::Positive => "positive",
+            Self::Negative => "negative",
         }
-        changed
-    })
-    .inner
+    }
+
+    /// 框内小标题与状态文案用的名称。
+    fn title(self) -> &'static str {
+        match self {
+            Self::Positive => "正向提示词",
+            Self::Negative => "负向提示词",
+        }
+    }
+}
+
+/// 中央区三块画在哪儿（纯几何，便于单测）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CentralLayout {
+    image: Rect,
+    positive: Rect,
+    negative: Rect,
+    /// 是否采用竖版（左图 + 右侧两段文字）。
+    portrait: bool,
+}
+
+/// 按可用矩形与图片像素宽高比算出中央区排版。
+///
+/// 只有 `aspect < 1.0` 才考虑竖版；正方形（1.0）与无图都走横版。
+/// 竖版有两道安全网：图片列 ≥ 240pt、文本列 ≥ 320pt，任一不满足就退回横版，
+/// 避免窄窗口里两块文本被压成一条缝。
+fn central_layout(avail: Rect, aspect: Option<f32>) -> CentralLayout {
+    let tall = aspect.map_or(false, |aspect| aspect < 1.0);
+    let text_col_w = avail.width() * (1.0 - IMAGE_SHARE) - CENTRAL_GAP;
+    let portrait =
+        tall && avail.width() * IMAGE_SHARE >= MIN_IMAGE_COL_W && text_col_w >= MIN_TEXT_COL_W;
+
+    if portrait {
+        let image_w = (avail.width() * IMAGE_SHARE).max(MIN_IMAGE_COL_W);
+        let image = Rect::from_min_size(avail.min, Vec2::new(image_w, avail.height()));
+        let text_x = avail.min.x + image_w + CENTRAL_GAP;
+        let text_w = (avail.max.x - text_x).max(1.0);
+        let text_h = (avail.height() - CENTRAL_GAP).max(1.0);
+        let positive_h = text_h * POSITIVE_SHARE;
+        let positive =
+            Rect::from_min_size(egui::pos2(text_x, avail.min.y), Vec2::new(text_w, positive_h));
+        let negative = Rect::from_min_size(
+            egui::pos2(text_x, avail.min.y + positive_h + CENTRAL_GAP),
+            Vec2::new(text_w, (text_h - positive_h).max(1.0)),
+        );
+        CentralLayout {
+            image,
+            positive,
+            negative,
+            portrait: true,
+        }
+    } else {
+        // 横版：图片在上吃掉可用高的 42%（沿用 0.1.x 的观感），下方一条横带 62:38 分给正/负向。
+        // 横向留长边：宽图的长边是宽，所以图片占满整行、文本在它下面左右排。
+        let image_h = (avail.height() * IMAGE_SHARE).clamp(140.0, 420.0);
+        let image = Rect::from_min_size(avail.min, Vec2::new(avail.width(), image_h));
+        let rest_y = avail.min.y + image_h + CENTRAL_GAP;
+        let rest_h = (avail.max.y - rest_y).max(1.0);
+        let positive_w = (avail.width() - CENTRAL_GAP).max(1.0) * POSITIVE_SHARE;
+        let positive = Rect::from_min_size(
+            egui::pos2(avail.min.x, rest_y),
+            Vec2::new(positive_w, rest_h),
+        );
+        let negative_x = avail.min.x + positive_w + CENTRAL_GAP;
+        let negative = Rect::from_min_size(
+            egui::pos2(negative_x, rest_y),
+            Vec2::new((avail.max.x - negative_x).max(1.0), rest_h),
+        );
+        CentralLayout {
+            image,
+            positive,
+            negative,
+            portrait: false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 侧边栏行
+
+/// 已读入内存、等待用户确认「图片内提示词会清空现有文本」的选图结果。
+///
+/// 字节在确认前就已读好：确认弹窗开着时源文件被改动/删除也不影响这次操作。
+struct PendingChoice {
+    path: PathBuf,
+    /// 源文件名，仅用于状态与悬停提示。
+    label: String,
+    /// 纹理缓存 key；同一张图在多次重绘间保持稳定。
+    key: String,
+    bytes: Vec<u8>,
+    ext: &'static str,
+    size: Option<(u32, u32)>,
+    /// ComfyUI 提示词检测结果（ADR-0013）。
+    detection: Detection,
+}
 
 /// 待入库图片（Pending Image）：只记源路径，保存时才按内容哈希写入托管目录（ADR-0004）。
 #[derive(Clone)]
@@ -2350,6 +2682,8 @@ struct SidebarRow {
     thumb: Option<ThumbSource>,
     /// 只读锁状态（ADR-0007）；草稿行恒为 false。
     locked: bool,
+    /// 提示词来源锁（ADR-0012）：为真时不可解锁，图标用强调色。
+    source_locked: bool,
 }
 
 /// 侧边栏缩略图的来源（快照，避免与 store 的可变借用冲突）。
@@ -2431,6 +2765,8 @@ fn paint_sidebar_row(
     editing: bool,
     // 锁图标：None 不画、Some(true) 常显 🔒、Some(false) 悬停显 🔓（§3，ADR-0007）。
     lock: Option<bool>,
+    // 来源锁（ADR-0012）：🔒 用强调色，与手动锁区分。
+    source_locked: bool,
     opacity: f32,
     elevated: bool,
 ) {
@@ -2548,7 +2884,10 @@ fn paint_sidebar_row(
             egui::Align2::CENTER_CENTER,
             if locked { "🔒" } else { "🔓" },
             egui::FontId::proportional(13.0),
-            with_opacity(p.text_muted, opacity),
+            with_opacity(
+                if source_locked { p.accent } else { p.text_muted },
+                opacity,
+            ),
         );
     }
 
@@ -3376,7 +3715,7 @@ mod tests {
         assert_eq!(managed_file_count(&store), 0);
     }
 
-    /// §6 边界 ②：同样内容只入库一份（另存为时不重复写）。
+    /// §6 边界 ②：同样内容只入库一份（同一张图被多条示例共用时不重复写）。
     #[test]
     fn same_content_is_stored_once() {
         let dir = TempDir::new("dedupe");
@@ -3445,5 +3784,87 @@ mod tests {
             .map(|id| store.load(*id).unwrap().unwrap().position)
             .collect();
         assert_eq!(positions, vec![0, 1, 2]);
+    }
+
+    /// 中央区排版是纯几何：用一条独立的近似断言，避免浮点比较卡在 1e-6 上。
+    fn assert_rect(actual: Rect, expected: Rect) {
+        for (a, e) in [
+            (actual.min.x, expected.min.x),
+            (actual.min.y, expected.min.y),
+            (actual.max.x, expected.max.x),
+            (actual.max.y, expected.max.y),
+        ] {
+            assert!((a - e).abs() < 0.01, "rect {actual:?} != {expected:?}");
+        }
+    }
+
+    /// 默认窗口 1180×760 的整窗尺寸。这里只当「一块足够大的可用矩形」用，
+    /// 取整数值是为了让期望值是好读的十进制，不代表真实中央区（真值来自 `available_rect_before_wrap`）。
+    fn avail_1180x760() -> Rect {
+        Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(1180.0, 760.0))
+    }
+
+    /// 竖图（宽高比 < 1）：图片占左列满高，正/负向在右列上下排（ADR-0011）。
+    ///
+    /// 期望值是字面量、不复用上面那组常量：常量被改错时这里必须失败。
+    #[test]
+    fn tall_image_uses_portrait_layout() {
+        let layout = central_layout(avail_1180x760(), Some(0.667));
+        assert!(layout.portrait);
+        assert_rect(
+            layout.image,
+            Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(495.6, 760.0)),
+        );
+        assert_rect(
+            layout.positive,
+            Rect::from_min_size(egui::pos2(501.6, 0.0), Vec2::new(678.4, 467.48)),
+        );
+        assert_rect(
+            layout.negative,
+            Rect::from_min_size(egui::pos2(501.6, 473.48), Vec2::new(678.4, 286.52)),
+        );
+        // 右列两段首尾相接、不留缝：负向底边必须正好落在可用区底边。
+        assert!((layout.negative.bottom() - 760.0).abs() < 0.01);
+    }
+
+    /// 横图（宽高比 > 1）：图片在上占满整行，正向在左下、负向在右下（各占一条横带）。
+    ///
+    /// 期望值是字面量、不复用上面那组常量：常量被改错时这里必须失败。
+    #[test]
+    fn wide_image_puts_prompts_side_by_side_below_the_image() {
+        let layout = central_layout(avail_1180x760(), Some(1.78));
+        assert!(!layout.portrait);
+        assert_rect(
+            layout.image,
+            Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(1180.0, 319.2)),
+        );
+        assert_rect(
+            layout.positive,
+            Rect::from_min_size(egui::pos2(0.0, 325.2), Vec2::new(727.88, 434.8)),
+        );
+        assert_rect(
+            layout.negative,
+            Rect::from_min_size(egui::pos2(733.88, 325.2), Vec2::new(446.12, 434.8)),
+        );
+        // 左右并排：负向必须在正向右侧、且同高（长边留给了图片）。
+        assert!(layout.negative.left() > layout.positive.right());
+        assert!((layout.negative.height() - layout.positive.height()).abs() < 0.01);
+        // 下方横带的底边必须正好落在可用区底边。
+        assert!((layout.negative.bottom() - 760.0).abs() < 0.01);
+    }
+
+    /// 正方形与「还没有图片」都走横版：竖版只在真的长边朝下时才有意义。
+    #[test]
+    fn square_and_missing_image_use_landscape_layout() {
+        assert!(!central_layout(avail_1180x760(), Some(1.0)).portrait);
+        assert!(!central_layout(avail_1180x760(), None).portrait);
+    }
+
+    /// 安全网：窄窗口里竖版会把两段文字压成一条缝，条件不满足就退回横版。
+    #[test]
+    fn narrow_window_falls_back_to_landscape_layout() {
+        let avail = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(500.0, 600.0));
+        assert!(500.0 * (1.0 - IMAGE_SHARE) - CENTRAL_GAP < MIN_TEXT_COL_W);
+        assert!(!central_layout(avail, Some(0.667)).portrait);
     }
 }

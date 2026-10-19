@@ -1,10 +1,10 @@
 //! 导出 / 导入：把示例打包成 `prompt-gallery-<时间戳>.zip`。
 //!
-//! 依据 ADR-0003：JSON 里只放元数据与五个分区文本，图片作为独立文件条目进 zip，
+//! 依据 ADR-0003：JSON 里只放元数据与两段提示词文本，图片作为独立文件条目进 zip，
 //! 因此导出包不会因为大图而膨胀，且图片天然按内容哈希去重。
 //!
-//! 分区标题是 UI 常量，不写进 JSON 的正文里；只在 `manifest.txt` 里作为说明列出，
-//! 保证「复制/导出的正向提示词不含分区标题」这条约束在数据层也成立。
+//! 归档版本 2 起只存 `positive` / `negative` 两段正文（ADR-0011）；
+//! 0.1.x 的五分区归档不再支持导入——分区边界无法自动合并。
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -16,11 +16,11 @@ use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::model::{compact_timestamp, now_unix, Example, Sections, SECTION_COUNT, SECTION_TITLES};
+use crate::model::{compact_timestamp, now_unix, Example, PromptSource};
 use crate::store::{ext_for_bytes, Store};
 
 /// 归档 JSON 的 schema 版本。
-pub const ARCHIVE_VERSION: u32 = 1;
+pub const ARCHIVE_VERSION: u32 = 2;
 /// 导出文件名前缀。
 pub const ARCHIVE_PREFIX: &str = "prompt-gallery";
 /// zip 内的元数据条目名。
@@ -37,9 +37,14 @@ struct ArchiveExample {
     title: String,
     /// 图片文件名（形如 `<hash>.<ext>`），对应 zip 内的 `images/<文件名>`；无图片为 `null`。
     image: Option<String>,
-    /// 只含五个分区的正文，不含分区标题。
-    sections: Vec<String>,
-    /// 只读锁（ADR-0007）。旧归档不含该字段时按未锁处理。
+    /// 正向提示词的正文（一段连续文本）。
+    positive: String,
+    /// 负向提示词的正文。
+    negative: String,
+    /// 提示词来源（ADR-0012）；缺字段时按 `manual` 处理。
+    #[serde(default)]
+    prompt_source: String,
+    /// 只读锁（ADR-0007）。缺该字段时按未锁处理。
     #[serde(default)]
     locked: bool,
     created_at: i64,
@@ -127,9 +132,9 @@ pub fn export_ids(store: &Store, ids: &[i64], target: &Path) -> Result<usize> {
             position: example.position,
             title: example.title.clone(),
             image: image_entry,
-            sections: (0..SECTION_COUNT)
-                .map(|index| example.sections.get(index).to_string())
-                .collect(),
+            positive: example.positive.clone(),
+            negative: example.negative.clone(),
+            prompt_source: example.prompt_source.as_str().to_string(),
             locked: example.locked,
             created_at: example.created_at,
             updated_at: example.updated_at,
@@ -220,14 +225,27 @@ pub fn import(store: &mut Store, source: &Path, mode: ImportMode) -> Result<Impo
     zip.by_name(DATA_ENTRY)
         .with_context(|| format!("归档缺少 {DATA_ENTRY}"))?
         .read_to_end(&mut raw)?;
-    let data: ArchiveData =
+    // 先读版本号：旧格式缺 positive/negative 字段，得给出能照着做的报错，
+    // 而不是 serde 的 "missing field"。
+    let value: serde_json::Value =
         serde_json::from_slice(&raw).context("解析归档元数据失败（data.json）")?;
-    if data.archive_version > ARCHIVE_VERSION {
+    let version = value
+        .get("archive_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    if version > ARCHIVE_VERSION {
         return Err(anyhow!(
-            "归档版本 {} 高于本程序支持的 {ARCHIVE_VERSION}，请升级 Prompt Gallery",
-            data.archive_version
+            "归档版本 {version} 高于本程序支持的 {ARCHIVE_VERSION}，请升级 Prompt Gallery"
         ));
     }
+    if version < 2 {
+        return Err(anyhow!(
+            "归档版本 {version} 是 0.1.x 的五分区格式，0.2.0 不再支持导入：\n\
+             分区边界无法自动合并成一段正向提示词。"
+        ));
+    }
+    let data: ArchiveData =
+        serde_json::from_value(value).context("解析归档元数据失败（data.json）")?;
 
     let mut report = ImportReport::default();
     let mut used_ids: HashSet<i64> = store
@@ -256,22 +274,16 @@ pub fn import(store: &mut Store, source: &Path, mode: ImportMode) -> Result<Impo
 
     // 4) 再落记录。id 冲突时另分配，绝不覆盖已有示例。
     for archived in &data.examples {
-        let mut sections = Sections::new();
-        for (index, text) in archived.sections.iter().enumerate() {
-            if index >= SECTION_COUNT {
-                break;
-            }
-            if let Some(slot) = sections.get_mut(index) {
-                *slot = text.clone();
-            }
-        }
-
+        let source = PromptSource::from_str_loose(&archived.prompt_source);
         let mut example = Example::draft(next_position);
         example.title = archived.title.clone();
-        example.sections = sections;
+        example.positive = archived.positive.clone();
+        example.negative = archived.negative.clone();
+        example.prompt_source = source;
         example.created_at = archived.created_at;
         example.updated_at = archived.updated_at;
-        example.locked = archived.locked;
+        // 来源锁与 locked 是同一件事的两面：导入也要维持这个不变量。
+        example.locked = archived.locked || source.is_locked_source();
 
         if let Some(entry) = archived.image.as_deref() {
             let entry = image_file_name_of(entry);
@@ -314,13 +326,10 @@ fn manifest_text(data: &ArchiveData) -> String {
     out.push_str(&format!("导出时间(Unix 秒): {}\n", data.exported_at));
     out.push_str(&format!("示例数量: {}\n", data.examples.len()));
     out.push_str("\n格式说明\n--------\n");
-    out.push_str("* data.json         示例元数据与五个分区的正文（不含分区标题）。\n");
+    out.push_str("* data.json         示例元数据与 positive / negative 两段正文。\n");
     out.push_str("* images/<hash>.<ext> 图片文件，文件名是内容的 blake3 哈希，天然去重。\n");
+    out.push_str("* prompt_source     提示词来源：manual（手写）或 image（从图片读出，永久只读）。\n");
     out.push_str("* 恢复方式：Prompt Gallery → 导入图库 → 选择本 zip。\n");
-    out.push_str("\n正向提示词的五个分区按固定顺序排列：\n");
-    for (index, title) in SECTION_TITLES.iter().enumerate() {
-        out.push_str(&format!("  {}. {}（UI 标题，不属于提示词正文）\n", index + 1, title));
-    }
     out
 }
 
@@ -408,7 +417,8 @@ mod tests {
         example.title = "示例一".into();
         example.image_hash = Some(hash.clone());
         example.image_ext = Some(ext);
-        example.sections.get_mut(1).unwrap().push_str("1girl, solo");
+        example.positive = "1girl, solo".into();
+        example.negative = "lowres, bad anatomy".into();
         let id = store.insert(&mut example).unwrap();
 
         let zip_path = dir.join(default_file_name(1_704_164_645).as_str());
@@ -426,22 +436,23 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let loaded = fresh.load(rows[0].id).unwrap().unwrap();
         assert_eq!(loaded.title, "示例一");
-        assert_eq!(loaded.sections.get(1), "1girl, solo");
-        assert_eq!(loaded.sections.get(0), "");
+        assert_eq!(loaded.positive, "1girl, solo");
+        assert_eq!(loaded.negative, "lowres, bad anatomy");
+        assert_eq!(loaded.prompt_source, PromptSource::Manual);
         assert!(loaded.image_hash.is_some());
         // 图片以内容哈希命名，跨库导入后哈希一致。
         assert_eq!(loaded.image_hash.as_deref(), Some(hash.as_str()));
         assert!(loaded.id.is_some());
         let _ = id;
 
-        // JSON 里不应出现分区标题。
+        // JSON 里只有两段正文，没有旧的分区数组。
         let file = fs::File::open(&zip_path).unwrap();
         let mut zip = ZipArchive::new(file).unwrap();
         let mut raw = String::new();
         zip.by_name(DATA_ENTRY).unwrap().read_to_string(&mut raw).unwrap();
-        for title in SECTION_TITLES {
-            assert!(!raw.contains(title), "data.json 不应包含分区标题 {title}");
-        }
+        assert!(raw.contains("\"positive\""), "data.json 应含 positive：{raw}");
+        assert!(raw.contains("\"negative\""), "data.json 应含 negative：{raw}");
+        assert!(!raw.contains("\"sections\""), "data.json 不应再有 sections：{raw}");
     }
 
     #[test]
@@ -494,13 +505,54 @@ mod tests {
             .unwrap();
         assert!(raw.contains("\"locked\": true"), "导出 JSON 应含 locked 字段：{raw}");
         let data: ArchiveData = serde_json::from_str(&raw).unwrap();
-        assert_eq!(data.archive_version, 1, "archive_version 应保持 1");
+        assert_eq!(data.archive_version, 2, "archive_version 应为 2");
         assert!(data.examples[0].locked);
+        assert_eq!(data.examples[0].prompt_source, "manual");
 
-        // 旧归档（无 locked 字段）应默认为未锁，且不报错。
-        let old = r#"{"id":1,"position":0,"title":"旧","image":null,"sections":["","","","",""],"created_at":0,"updated_at":0}"#;
+        // 缺 locked 与 prompt_source 字段的 JSON：按未锁 + 手写处理，且不报错。
+        let old = r#"{"id":1,"position":0,"title":"旧","image":null,"positive":"","negative":"","created_at":0,"updated_at":0}"#;
         let parsed: ArchiveExample = serde_json::from_str(old).unwrap();
-        assert!(!parsed.locked, "旧 JSON 缺 locked 时应按未锁处理");
+        assert!(!parsed.locked, "缺 locked 时应按未锁处理");
+        assert!(
+            PromptSource::from_str_loose(&parsed.prompt_source) == PromptSource::Manual,
+            "缺 prompt_source 时应按手写处理"
+        );
+    }
+
+    /// 0.1.x 的五分区包必须明确报错，而不是默默丢掉正文。
+    #[test]
+    fn version_1_archive_is_rejected() {
+        let dir = TempDir::new("v1-archive");
+        let mut store = Store::open_in(dir.join("a")).unwrap();
+        let mut example = Example::draft(0);
+        example.title = "旧包".into();
+        store.insert(&mut example).unwrap();
+
+        // 手工造一个 v1 包：data.json 是五分区格式。
+        let zip_path = dir.join("old.zip");
+        {
+            let file = fs::File::create(&zip_path).unwrap();
+            let mut zip = ZipWriter::new(file);
+            let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zip.start_file(DATA_ENTRY, options).unwrap();
+            zip.write_all(
+                br#"{"archive_version":1,"app":"Prompt Gallery 0.1.4","exported_at":0,
+                     "examples":[{"id":1,"position":0,"title":"old","image":null,
+                                  "sections":["","","","",""],"created_at":0,"updated_at":0}]}"#,
+            )
+            .unwrap();
+            zip.finish().unwrap();
+        }
+
+        let err = import(&mut store, &zip_path, ImportMode::Append)
+            .err()
+            .expect("v1 归档必须被拒绝");
+        let message = format!("{err:#}");
+        assert!(message.contains("0.1.x"), "应说明是 0.1.x 的格式：{message}");
+        assert!(
+            message.contains("不再支持导入"),
+            "应明确不支持：{message}"
+        );
     }
 
     #[test]
@@ -520,5 +572,30 @@ mod tests {
         assert_eq!(report.added, 1);
         let loaded = fresh.load(fresh.rows()[0].id).unwrap().unwrap();
         assert!(loaded.locked, "锁定状态应随归档导入");
+    }
+
+    #[test]
+    fn image_sourced_prompt_survives_export_import() {
+        let dir = TempDir::new("source-roundtrip");
+        let mut store = Store::open_in(dir.join("a")).unwrap();
+        let mut example = Example::draft(0);
+        example.title = "读自图片".into();
+        let id = store.insert(&mut example).unwrap();
+        store
+            .apply_image_prompt(id, "deadbeef", "png", "正向", "负向")
+            .unwrap();
+
+        let zip_path = dir.join("pack.zip");
+        export(&store, &zip_path).unwrap();
+
+        let mut fresh = Store::open_in(dir.join("b")).unwrap();
+        import(&mut fresh, &zip_path, ImportMode::Append).unwrap();
+        let loaded = fresh.load(fresh.rows()[0].id).unwrap().unwrap();
+        assert_eq!(loaded.prompt_source, PromptSource::Image, "来源应随归档往返");
+        assert!(loaded.locked, "来源锁在导入端也要维持 locked");
+        assert_eq!(loaded.positive, "正向");
+        assert_eq!(loaded.negative, "负向");
+        // 导入不重新检测图片，也不改写来源。
+        assert!(fresh.set_locked(loaded.id.unwrap(), false).is_err());
     }
 }

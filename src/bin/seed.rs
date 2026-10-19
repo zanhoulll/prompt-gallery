@@ -27,21 +27,20 @@ fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    let sections = [
+    // 0.2.0 起只有正/负向两段（ADR-0011）：原来五段在这里合成一段正向。
+    let positive = [
         "masterpiece, best quality, very aesthetic, absurdres",
         "1girl, solo, silver hair, blue eyes, detailed face",
         "white shirt, black ribbon tie, pleated skirt",
         "standing, hands behind back, looking at viewer",
         "classroom, window light, rim light, soft shadows",
-    ];
+    ]
+    .join("\n\n");
 
     let mut example = Example::draft(0);
     example.title = "教室里的银发少女".to_string();
-    for (index, text) in sections.iter().enumerate() {
-        if let Some(slot) = example.sections.get_mut(index) {
-            slot.push_str(text);
-        }
-    }
+    example.positive = positive;
+    example.negative = "lowres, worst quality, bad anatomy".to_string();
     if let Some((hash, ext)) = image {
         example.image_hash = Some(hash);
         example.image_ext = Some(ext);
@@ -50,11 +49,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut second = Example::draft(0);
     second.title = "无图示例".to_string();
-    second
-        .sections
-        .get_mut(0)
-        .unwrap()
-        .push_str("masterpiece, best quality");
+    second.positive = "masterpiece, best quality".to_string();
     let second_id = store.insert(&mut second)?;
 
     println!(

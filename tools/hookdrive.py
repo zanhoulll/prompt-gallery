@@ -13,10 +13,12 @@
     text 字符串         输入文本（整行剩余部分，保留空格）
     key R [ctrl] [shift] [alt]   按键（键名同 egui，如 R / Escape / Enter）
     shot 名称           截图到 <data>/hook/shots/<名称>.png 并等待应答
+    image 路径          让应用走一遍「选了这张图」的入库路径（原生文件对话框无法被合成输入驱动）
     wait 毫秒           应用侧等待（自动保存防抖请用 wait 700）
     quit                应用退出
     close               驱动侧发 WM_CLOSE（真实关窗路径，用于弹窗测试）
     kill                驱动侧强制结束进程（用于「应用应保持存活」的收尾）
+    resize 宽 高        驱动侧改窗口客户区尺寸（SetWindowPos，单位物理像素）
     minimize            驱动侧最小化窗口（用于验证「最小化时没有新帧」的已知限制）
     expect-exit         等进程退出并以其退出码结束场景
 
@@ -102,6 +104,10 @@ def build_request(verb: str, rest: str, state: dict):
         return request
     if verb == "shot":
         return {"cmd": "shot", "name": rest or "shot"}
+    if verb == "image":
+        if not rest:
+            raise SceneError("image 需要图片路径")
+        return {"cmd": "image", "path": rest.strip()}
     if verb == "wait":
         if len(fields) != 1:
             raise SceneError("wait 需要毫秒数")
@@ -274,6 +280,17 @@ def run(args):
                 fail("第 " + str(lineno) + " 行：找不到应用窗口，无法发 WM_CLOSE", ctx)
             ctypes.windll.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
             print("[" + str(lineno) + "] close -> WM_CLOSE")
+            continue
+        if verb == "resize":
+            hwnd = find_main_window(proc.pid if proc else None)
+            if not hwnd:
+                fail("第 " + str(lineno) + " 行：找不到应用窗口，无法改尺寸", ctx)
+            fields = rest.split()
+            if len(fields) != 2:
+                fail("第 " + str(lineno) + " 行：resize 需要宽高两个数字", ctx)
+            width, height = int(float(fields[0])), int(float(fields[1]))
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, width, height, 0x0002 | 0x0004 | 0x0010)
+            print("[" + str(lineno) + "] resize -> " + str(width) + "x" + str(height))
             continue
         if verb == "minimize":
             hwnd = find_main_window(proc.pid if proc else None)
